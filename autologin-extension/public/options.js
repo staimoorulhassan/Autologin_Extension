@@ -317,6 +317,42 @@ async function clearAllData() {
 }
 
 /**
+ * Load and display saved API key status
+ */
+function loadApiKey() {
+  chrome.storage.local.get('openrouter_api_key', (result) => {
+    const key = result['openrouter_api_key'] || '';
+    const input = document.getElementById('apiKeyInput');
+    const status = document.getElementById('apiKeyStatus');
+    if (key) {
+      input.value = key;
+      status.textContent = '✅ API key saved';
+      status.style.color = '#155724';
+    } else {
+      status.textContent = '⚠️ No API key set — AI page analysis disabled';
+      status.style.color = '#856404';
+    }
+  });
+}
+
+/**
+ * Save API key to storage
+ */
+function saveApiKey() {
+  const key = document.getElementById('apiKeyInput').value.trim();
+  const status = document.getElementById('apiKeyStatus');
+  if (!key) {
+    status.textContent = '❌ Please enter a key';
+    status.style.color = '#721c24';
+    return;
+  }
+  chrome.storage.local.set({ openrouter_api_key: key }, () => {
+    status.textContent = '✅ API key saved';
+    status.style.color = '#155724';
+  });
+}
+
+/**
  * Initialize event listeners
  */
 document.addEventListener('DOMContentLoaded', () => {
@@ -326,6 +362,24 @@ document.addEventListener('DOMContentLoaded', () => {
   const clearBtn = document.getElementById('clearBtn');
   const clearDataBtn = document.getElementById('clearDataBtn');
   const backLink = document.getElementById('backLink');
+  const saveApiKeyBtn = document.getElementById('saveApiKeyBtn');
+  const toggleApiKey = document.getElementById('toggleApiKey');
+  const apiKeyInput = document.getElementById('apiKeyInput');
+
+  // Load saved API key on open
+  loadApiKey();
+
+  if (saveApiKeyBtn) {
+    saveApiKeyBtn.addEventListener('click', saveApiKey);
+  }
+
+  if (toggleApiKey && apiKeyInput) {
+    toggleApiKey.addEventListener('click', () => {
+      const isPassword = apiKeyInput.type === 'password';
+      apiKeyInput.type = isPassword ? 'text' : 'password';
+      toggleApiKey.textContent = isPassword ? 'Hide' : 'Show';
+    });
+  }
 
   if (importBtn) {
     importBtn.addEventListener('click', () => {

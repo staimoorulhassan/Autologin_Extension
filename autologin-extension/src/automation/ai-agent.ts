@@ -10,17 +10,25 @@ import type { Credential, LoginStatus } from '@/types/index';
 
 const AI_CONFIG = {
   baseUrl: 'https://openrouter.ai/api/v1',
-  apiKey: 'YOUR_OPENROUTER_API_KEY', // Get a free key at https://openrouter.ai/keys
   // Free vision models in priority order — reliable first, then higher-quality
   visionModels: [
-    'baidu/qianfan-ocr-fast:free',      // Fast, reliable, always works
-    'google/gemma-4-31b-it:free',       // Better quality when not rate-limited
-    'google/gemma-4-26b-a4b-it:free',   // Gemma fallback
-    'nvidia/nemotron-nano-12b-v2-vl:free', // Last resort
+    'baidu/qianfan-ocr-fast:free',
+    'google/gemma-4-31b-it:free',
+    'google/gemma-4-26b-a4b-it:free',
+    'nvidia/nemotron-nano-12b-v2-vl:free',
   ],
   textModel: 'baidu/qianfan-ocr-fast:free',
   timeout: 45000
 };
+
+/** Load API key from storage at runtime — never hardcoded in source. */
+async function getApiKey(): Promise<string> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get('openrouter_api_key', (result) => {
+      resolve((result['openrouter_api_key'] as string) || '');
+    });
+  });
+}
 
 export interface LoginContext {
   credential: Credential;
@@ -255,13 +263,14 @@ async function tryVisionModel(
   model: string,
   prompt: string,
   base64Data: string,
+  apiKey: string,
   signal: AbortSignal
 ): Promise<{ success: boolean; content?: string; error?: string }> {
   const response = await fetch(`${AI_CONFIG.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${AI_CONFIG.apiKey}`,
+      'Authorization': `Bearer ${apiKey}`,
       'HTTP-Referer': 'https://autologin-extension',
       'X-Title': 'AutoLogin Extension'
     },
@@ -298,6 +307,11 @@ async function callAIWithVision(
   prompt: string,
   imageBase64: string
 ): Promise<{ success: boolean; content?: string; error?: string }> {
+  const apiKey = await getApiKey();
+  if (!apiKey) {
+    return { success: false, error: 'OpenRouter API key not set. Open extension options to configure it.' };
+  }
+
   const base64Data = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
   const errors: string[] = [];
 
@@ -306,7 +320,7 @@ async function callAIWithVision(
     const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
 
     try {
-      const result = await tryVisionModel(model, prompt, base64Data, controller.signal);
+      const result = await tryVisionModel(model, prompt, base64Data, apiKey, controller.signal);
       clearTimeout(timeoutId);
 
       if (result.success) {
@@ -332,6 +346,11 @@ async function callAIWithVision(
 async function callAIText(
   prompt: string
 ): Promise<{ success: boolean; content?: string; error?: string }> {
+  const apiKey = await getApiKey();
+  if (!apiKey) {
+    return { success: false, error: 'OpenRouter API key not set.' };
+  }
+
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
@@ -340,7 +359,7 @@ async function callAIText(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${AI_CONFIG.apiKey}`,
+        'Authorization': `Bearer ${apiKey}`,
         'HTTP-Referer': 'https://autologin-extension',
         'X-Title': 'AutoLogin Extension'
       },

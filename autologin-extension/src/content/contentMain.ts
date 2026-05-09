@@ -393,8 +393,13 @@ function submitLoginForm(selector?: string): boolean {
 
     // Strategy 0: Use AI-provided selector directly
     if (selector) {
-      submitButton = document.querySelector(selector) as HTMLElement | null;
-      if (submitButton) console.log(`AutoLogin: Found button via AI selector: "${selector}"`);
+      try {
+        submitButton = document.querySelector(selector) as HTMLElement | null;
+        if (submitButton) console.log(`AutoLogin: Found button via AI selector: "${selector}"`);
+      } catch {
+        // Invalid CSS (e.g. jQuery :contains()) — fall through to text-based strategies
+        console.log(`AutoLogin: AI selector "${selector}" is invalid CSS, trying fallbacks`);
+      }
     }
 
     // Strategy 1: Look for buttons with explicit type="submit"

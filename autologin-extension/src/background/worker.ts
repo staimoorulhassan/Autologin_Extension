@@ -503,6 +503,12 @@ async function saveSuccessToFile(
  */
 async function captureTabScreenshot(tabId: number): Promise<string | null> {
   try {
+    // Firefox: captureTab works on any tab (active or not) with the `tabs` permission
+    const gBrowser = (globalThis as Record<string, unknown>)['browser'] as { tabs?: { captureTab?: (id: number, opts: object) => Promise<string> } } | undefined;
+    if (gBrowser?.tabs?.captureTab) {
+      return await gBrowser.tabs.captureTab(tabId, { format: 'png' });
+    }
+    // Chrome fallback: captureVisibleTab only works if tab is the active one
     const tab = await chrome.tabs.get(tabId);
     if (!tab.windowId) return null;
     return await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
@@ -945,12 +951,33 @@ async function processNextCredential(): Promise<void> {
 
     if (!aiResult) {
       console.log(`AutoLogin: AI page analysis unavailable at step ${stepCount}, falling back to DOM detection`);
-      // Fallback to content script DOM detection
       const formResp = await sendToContent(tabId, { type: MESSAGE_TYPES.DETECT_FORM, data: { url: cred.url } }, 10000);
       if (!formResp.success || !formResp.data?.found) {
         await finishCredential(state, cred, 'FORM_NOT_FOUND', tabId, `Step ${stepCount}: Neither AI nor DOM found form`);
         return;
       }
+
+      const detectedFields = formResp.data.fields ?? {};
+      console.log(`AutoLogin: DOM fallback filling form at step ${stepCount}`, detectedFields);
+      const fillResp = await sendToContent(tabId, {
+        type: MESSAGE_TYPES.FILL_FORM,
+        data: { fields: detectedFields, username: cred.username, password: cred.password }
+      }, 10000);
+      if (!fillResp.success) {
+        await finishCredential(state, cred, 'FORM_FILL_FAILED', tabId, `Step ${stepCount}: DOM fill failed: ${fillResp.error}`);
+        return;
+      }
+      console.log(`AutoLogin: DOM fallback filled ${fillResp.data?.fieldsFilled} fields at step ${stepCount}`);
+
+      await sendToContent(tabId, {
+        type: MESSAGE_TYPES.SUBMIT_FORM,
+        data: { selector: detectedFields.submit_selector }
+      }, 10000);
+
+      await waitForTabComplete(tabId, 20000);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log(`AutoLogin: DOM fallback submitted form at step ${stepCount}, checking login status`);
+      break;
     } else {
       // Check if already on dashboard
       if (aiResult.pageStep === 'dashboard') {

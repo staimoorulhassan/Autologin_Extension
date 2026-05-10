@@ -113,27 +113,18 @@ export async function sendToActiveTab<T extends ContentMessage>(
   message: T,
   timeoutMs = 5000
 ): Promise<MessageResponse<MessageResponseMap[T['type']]>> {
-  return new Promise(async (resolve, reject) => {
-    try {
-      // Query for the active tab in the current window
-      const tabs = await chromeTabsQuery({ active: true, currentWindow: true });
+  const tabs = await chromeTabsQuery({ active: true, currentWindow: true });
 
-      if (tabs.length === 0) {
-        throw new Error('No active tab found in current window');
-      }
+  if (tabs.length === 0) {
+    throw new Error('No active tab found in current window');
+  }
 
-      const tabId = tabs[0].id;
-      if (tabId === undefined) {
-        throw new Error('Active tab has no ID');
-      }
+  const tabId = tabs[0].id;
+  if (tabId === undefined) {
+    throw new Error('Active tab has no ID');
+  }
 
-      // Send message to the active tab
-      const response = await sendToContent(tabId, message, timeoutMs);
-      resolve(response);
-    } catch (error) {
-      reject(error);
-    }
-  });
+  return sendToContent(tabId, message, timeoutMs);
 }
 
 /**

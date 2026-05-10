@@ -242,11 +242,11 @@ export class AutomationEngine {
    */
   detectBotProtection(html: string): boolean {
     const botPatterns = [
-      /cloudflare[\-_]?turnstile/i,
-      /cf[\-_]?turnstile/i,
+      /cloudflare[-_]?turnstile/i,
+      /cf[-_]?turnstile/i,
       /_cf_chl_jschl_tick/,
-      /challenge\-form/i,
-      /bot[\-_]?detection/i,
+      /challenge-form/i,
+      /bot[-_]?detection/i,
     ];
 
     return botPatterns.some(pattern => pattern.test(html));

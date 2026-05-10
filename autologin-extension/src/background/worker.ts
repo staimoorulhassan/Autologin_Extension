@@ -377,7 +377,6 @@ registerHandler(MESSAGE_TYPES.CLEANUP_DB, async (rawData, _sender) => {
  */
 function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
   return new Promise((resolve) => {
-    let completeCount = 0;
     let stabilityTimeout: ReturnType<typeof setTimeout> | null = null;
     const mainTimeout = setTimeout(() => {
       cleanup();
@@ -396,8 +395,7 @@ function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
         if (stabilityTimeout) clearTimeout(stabilityTimeout);
 
         if (info.status === 'complete') {
-          completeCount++;
-          // Wait for tab to be stable (2 more "complete" events or 1 second)
+          // Wait for tab to be stable before resolving
           stabilityTimeout = setTimeout(() => {
             cleanup();
             resolve();

@@ -13,7 +13,7 @@ import {
   dbUtils,
   AutoLoginDB
 } from '../../store/database';
-import { Credential, Cookie, LoginLog, Screenshot, LoginStatus } from '../../types/index';
+import { Credential, Cookie, LoginStatus } from '../../types/index';
 
 describe('Database Module', () => {
   beforeEach(async () => {
@@ -534,7 +534,7 @@ describe('Database Module', () => {
           captcha_type: 'reCAPTCHA'
         };
 
-        const id = await logStore.add(logData);
+        await logStore.add(logData);
         const logs = await logStore.getByAccountId(accountId);
 
         expect(logs[0].status).toBe(LoginStatus.WRONG_PASSWORD);

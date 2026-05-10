@@ -29,41 +29,38 @@ describe('Extension Scaffold', () => {
   });
 
   describe('Module Resolution', () => {
-    it('should resolve types module', () => {
-      const types = require('../types/index');
+    it('should resolve types module', async () => {
+      const types = await import('../types/index');
       expect(types).toBeDefined();
     });
   });
 
   describe('React Setup', () => {
-    it('should have React available', () => {
-      const React = require('react');
+    it('should have React available', async () => {
+      const React = await import('react');
       expect(React).toBeDefined();
       expect(React.default).toBeDefined();
     });
 
-    it('should have ReactDOM available', () => {
-      const ReactDOM = require('react-dom');
+    it('should have ReactDOM available', async () => {
+      const ReactDOM = await import('react-dom');
       expect(ReactDOM).toBeDefined();
     });
   });
 
   describe('Build Configuration', () => {
     it('should have webpack configuration', () => {
-      const path = require('path');
-      const configPath = path.resolve(__dirname, '../../webpack.config.js');
+      const configPath = `${__dirname}/../../webpack.config.js`;
       expect(configPath).toBeTruthy();
     });
 
     it('should have jest configuration', () => {
-      const path = require('path');
-      const configPath = path.resolve(__dirname, '../../jest.config.js');
+      const configPath = `${__dirname}/../../jest.config.js`;
       expect(configPath).toBeTruthy();
     });
 
     it('should have typescript configuration', () => {
-      const path = require('path');
-      const configPath = path.resolve(__dirname, '../../tsconfig.json');
+      const configPath = `${__dirname}/../../tsconfig.json`;
       expect(configPath).toBeTruthy();
     });
   });

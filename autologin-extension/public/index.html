@@ -2,10 +2,519 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="0; url=popup.html">
-  <title>AutoLogin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AutoLogin — Bulk Login Automation Extension</title>
+  <meta name="description" content="AutoLogin is a Chrome and Firefox extension that logs into hundreds of websites automatically using AI vision. One click, no configuration.">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --blue: #1a73e8;
+      --blue-dark: #1557b0;
+      --green: #34a853;
+      --text: #202124;
+      --muted: #5f6368;
+      --border: #dadce0;
+      --bg: #f8f9fa;
+      --card: #ffffff;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      line-height: 1.6;
+    }
+
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* NAV */
+    nav {
+      background: white;
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .nav-brand {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--blue);
+      letter-spacing: -0.3px;
+    }
+    .nav-links { display: flex; gap: 24px; align-items: center; }
+    .nav-links a { font-size: 14px; color: var(--muted); font-weight: 500; }
+    .btn {
+      display: inline-block;
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-primary { background: var(--blue); color: white; }
+    .btn-primary:hover { background: var(--blue-dark); text-decoration: none; }
+    .btn-outline { border: 1px solid var(--border); color: var(--text); background: white; }
+    .btn-outline:hover { background: var(--bg); text-decoration: none; }
+
+    /* HERO */
+    .hero {
+      text-align: center;
+      padding: 80px 24px 64px;
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    .hero-badge {
+      display: inline-block;
+      background: #e8f0fe;
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      padding: 4px 12px;
+      border-radius: 20px;
+      margin-bottom: 20px;
+    }
+    .hero h1 {
+      font-size: clamp(32px, 5vw, 52px);
+      font-weight: 800;
+      line-height: 1.15;
+      letter-spacing: -1px;
+      margin-bottom: 20px;
+      color: var(--text);
+    }
+    .hero h1 span { color: var(--blue); }
+    .hero p {
+      font-size: 18px;
+      color: var(--muted);
+      max-width: 580px;
+      margin: 0 auto 36px;
+    }
+    .hero-buttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+
+    /* STATS */
+    .stats {
+      display: flex;
+      justify-content: center;
+      gap: 48px;
+      padding: 32px 24px;
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      background: white;
+      flex-wrap: wrap;
+    }
+    .stat { text-align: center; }
+    .stat-value { font-size: 28px; font-weight: 800; color: var(--blue); }
+    .stat-label { font-size: 13px; color: var(--muted); margin-top: 2px; }
+
+    /* SECTION */
+    section { padding: 64px 24px; }
+    .section-inner { max-width: 960px; margin: 0 auto; }
+    .section-label {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 12px;
+    }
+    .section-title {
+      font-size: clamp(24px, 3vw, 36px);
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      margin-bottom: 12px;
+    }
+    .section-sub { font-size: 16px; color: var(--muted); max-width: 540px; margin-bottom: 40px; }
+
+    /* FEATURE GRID */
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 20px;
+    }
+    .feature-card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+    }
+    .feature-icon { font-size: 28px; margin-bottom: 12px; }
+    .feature-card h3 { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+    .feature-card p { font-size: 13px; color: var(--muted); line-height: 1.55; }
+
+    /* HOW IT WORKS */
+    .steps { display: flex; flex-direction: column; gap: 0; }
+    .step {
+      display: flex;
+      gap: 24px;
+      padding: 28px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .step:last-child { border-bottom: none; }
+    .step-num {
+      flex-shrink: 0;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: var(--blue);
+      color: white;
+      font-weight: 800;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .step-content h3 { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+    .step-content p { font-size: 14px; color: var(--muted); }
+
+    /* CAPTCHA TABLE */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th {
+      text-align: left;
+      padding: 10px 16px;
+      background: var(--bg);
+      border-bottom: 2px solid var(--border);
+      font-weight: 600;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+    tr:last-child td { border-bottom: none; }
+
+    /* STATUS CODES */
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .status-pill {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .status-pill code {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      font-family: 'Courier New', monospace;
+      color: var(--blue);
+      margin-bottom: 4px;
+    }
+    .status-pill span { font-size: 13px; color: var(--muted); }
+
+    /* SECURITY */
+    .security-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+    }
+    .security-card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+    }
+    .security-card h3 { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
+    .security-card p { font-size: 13px; color: var(--muted); line-height: 1.55; }
+
+    /* INSTALL */
+    .install-box {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 40px;
+      text-align: center;
+    }
+    .install-box h2 { font-size: 28px; font-weight: 800; margin-bottom: 12px; }
+    .install-box p { color: var(--muted); margin-bottom: 28px; font-size: 15px; }
+    .install-steps {
+      display: flex;
+      justify-content: center;
+      gap: 0;
+      margin-bottom: 32px;
+      flex-wrap: wrap;
+    }
+    .install-step {
+      padding: 0 24px;
+      border-right: 1px solid var(--border);
+      text-align: center;
+    }
+    .install-step:last-child { border-right: none; }
+    .install-step .num { font-size: 28px; font-weight: 800; color: var(--blue); }
+    .install-step .label { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+    /* FOOTER */
+    footer {
+      background: white;
+      border-top: 1px solid var(--border);
+      padding: 24px;
+      text-align: center;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    footer a { color: var(--muted); }
+    footer a:hover { color: var(--blue); }
+
+    /* ALT BG */
+    .bg-white { background: white; }
+  </style>
 </head>
 <body>
-  <script>window.location.replace('popup.html');</script>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-brand">🔐 AutoLogin</div>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#how-it-works">How It Works</a>
+    <a href="#security">Security</a>
+    <a href="https://github.com/staimoorulhassan/Autologin_Extension" target="_blank">GitHub</a>
+    <a href="https://github.com/staimoorulhassan/Autologin_Extension/releases" class="btn btn-primary">Download</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-badge">Chrome &amp; Firefox Extension</div>
+  <h1>Log into <span>hundreds of sites</span><br>with one click</h1>
+  <p>AutoLogin automates bulk logins using AI vision — no selectors to write, no per-site configuration. Just paste your credentials and press Start.</p>
+  <div class="hero-buttons">
+    <a href="https://github.com/staimoorulhassan/Autologin_Extension/releases" class="btn btn-primary">⬇ Download Extension</a>
+    <a href="https://github.com/staimoorulhassan/Autologin_Extension" class="btn btn-outline">View on GitHub</a>
+  </div>
+</div>
+
+<!-- STATS -->
+<div class="stats">
+  <div class="stat"><div class="stat-value">AI-Powered</div><div class="stat-label">Vision model reads every page</div></div>
+  <div class="stat"><div class="stat-value">6 Steps</div><div class="stat-label">Per account — handles MFA flows</div></div>
+  <div class="stat"><div class="stat-value">Zero Config</div><div class="stat-label">Works on sites never seen before</div></div>
+  <div class="stat"><div class="stat-value">Encrypted</div><div class="stat-label">XSalsa20-Poly1305 at rest</div></div>
+</div>
+
+<!-- FEATURES -->
+<section id="features">
+  <div class="section-inner">
+    <div class="section-label">Features</div>
+    <h2 class="section-title">Everything you need for bulk login automation</h2>
+    <p class="section-sub">Built for power users who need to authenticate across dozens or hundreds of accounts reliably.</p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🤖</div>
+        <h3>AI Vision Detection</h3>
+        <p>Takes a live screenshot and asks an AI model what step the login is on and what the field selectors are. Works on pages it has never seen before.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">⚡</div>
+        <h3>Batch Processing</h3>
+        <p>Queue hundreds of accounts and process them sequentially. Configurable delay between accounts. Pause and resume at any time.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🧩</div>
+        <h3>Multi-Step Flows</h3>
+        <p>Handles email-first flows like Google, Microsoft, Yahoo, and LinkedIn. Up to 6 steps per account — enough for email → CAPTCHA → password → 2FA.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🍪</div>
+        <h3>Cookie Capture</h3>
+        <p>After every successful login, all session cookies are saved to your Downloads folder as a text file. Useful for session replay or auditing.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🛡️</div>
+        <h3>CAPTCHA Handling</h3>
+        <p>Checkbox reCAPTCHA clicked automatically. Text and math CAPTCHAs solved by AI. Image grid CAPTCHAs pause for human intervention.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📊</div>
+        <h3>Per-Account Logs</h3>
+        <p>Every attempt logged with status, timestamp, and error detail. Export as CSV or JSON. Full history retained in encrypted IndexedDB.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🧠</div>
+        <h3>DOM Fallback</h3>
+        <p>If AI is not configured, falls back to DOM-based detection using selector chains, visibility filtering, and React/Angular native input setter.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🕵️</div>
+        <h3>Human-Like Behavior</h3>
+        <p>Random per-character typing delays. Mouse events fired in correct sequence. Tabs opened in background. Cookies cleared between accounts.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📥</div>
+        <h3>Easy Import</h3>
+        <p>Paste credentials in CSV format or colon-delimited (url:username:password). Import hundreds of accounts in seconds via the Options page.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section class="bg-white" id="how-it-works">
+  <div class="section-inner">
+    <div class="section-label">How It Works</div>
+    <h2 class="section-title">From zero to logged in</h2>
+    <p class="section-sub">No selectors to write. No per-site setup. The AI figures it out.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-content">
+          <h3>Import your credentials</h3>
+          <p>Open Options and paste your accounts in CSV or colon-delimited format. The extension stores them encrypted in IndexedDB on your device.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-content">
+          <h3>Press Start Batch Login</h3>
+          <p>The extension opens each site in a background tab, waits for it to load, then takes a screenshot.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-content">
+          <h3>AI reads the page</h3>
+          <p>The screenshot is sent to Pollinations (gemini-fast) with a structured prompt. The AI returns the login step, CSS selectors for each field, and whether a CAPTCHA is present.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div class="step-content">
+          <h3>Fields filled and submitted</h3>
+          <p>Username and password typed with realistic delays. Submit clicked. The extension waits for navigation and checks whether login succeeded.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">5</div>
+        <div class="step-content">
+          <h3>Cookies saved, account logged out</h3>
+          <p>On success, all session cookies are captured and saved. The extension then logs out and clears cookies before moving to the next account.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CAPTCHA -->
+<section>
+  <div class="section-inner">
+    <div class="section-label">CAPTCHA Support</div>
+    <h2 class="section-title">Handles CAPTCHAs automatically where possible</h2>
+    <p class="section-sub">After 2 failed CAPTCHA attempts the extension pauses — protecting accounts from lockout.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>CAPTCHA Type</th><th>What Happens</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>reCAPTCHA v2 checkbox ("I'm not a robot")</td><td>✅ Clicked automatically</td></tr>
+          <tr><td>reCAPTCHA v3 (invisible, score-based)</td><td>✅ No action needed — extension behaves normally</td></tr>
+          <tr><td>Text CAPTCHA (distorted letters)</td><td>✅ AI reads screenshot and types the answer</td></tr>
+          <tr><td>Math CAPTCHA (e.g. "3 + 5 = ?")</td><td>✅ AI solves and types the answer</td></tr>
+          <tr><td>reCAPTCHA v2 image grid ("select traffic lights")</td><td>⏸ Paused — tab stays open for you to solve manually</td></tr>
+          <tr><td>hCaptcha image challenge</td><td>⏸ Paused — same as above</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- STATUS CODES -->
+<section class="bg-white">
+  <div class="section-inner">
+    <div class="section-label">Developer Mode</div>
+    <h2 class="section-title">Full visibility into every attempt</h2>
+    <p class="section-sub">The Developer tab in the popup shows live logs, progress, and controls for every account in the batch.</p>
+    <div class="status-grid">
+      <div class="status-pill"><code>SUCCESS</code><span>Logged in — cookies saved</span></div>
+      <div class="status-pill"><code>WRONG_PASSWORD</code><span>Form submitted but rejected</span></div>
+      <div class="status-pill"><code>CAPTCHA_PAUSED</code><span>Waiting for human solve</span></div>
+      <div class="status-pill"><code>CAPTCHA_TIMEOUT</code><span>CAPTCHA not solved in time</span></div>
+      <div class="status-pill"><code>FORM_NOT_FOUND</code><span>No login form detected</span></div>
+      <div class="status-pill"><code>FORM_FILL_FAILED</code><span>Found fields but couldn't fill</span></div>
+      <div class="status-pill"><code>FORM_SUBMIT_FAILED</code><span>Submit button not clickable</span></div>
+      <div class="status-pill"><code>NETWORK_ERROR</code><span>Tab failed to load</span></div>
+      <div class="status-pill"><code>BLOCKED_BY_BOT_DETECTION</code><span>Cloudflare or similar</span></div>
+      <div class="status-pill"><code>IN_PROGRESS</code><span>Currently processing</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- SECURITY -->
+<section id="security">
+  <div class="section-inner">
+    <div class="section-label">Security</div>
+    <h2 class="section-title">Your credentials never leave your device</h2>
+    <p class="section-sub">Everything is stored locally, encrypted. No server. No sync. No cloud.</p>
+    <div class="security-grid">
+      <div class="security-card">
+        <h3>🔒 Encrypted at rest</h3>
+        <p>Passwords are encrypted with XSalsa20-Poly1305 (the same algorithm used by Signal) before being written to IndexedDB. The key is derived from your browser profile — without your browser, the data cannot be decrypted.</p>
+      </div>
+      <div class="security-card">
+        <h3>📡 No remote storage</h3>
+        <p>All credentials, cookies, and logs are stored in IndexedDB on your local device only. The extension makes no calls to any server except the AI provider you configure and the sites you're logging into.</p>
+      </div>
+      <div class="security-card">
+        <h3>🔑 API key security</h3>
+        <p>Your AI provider key is stored in <code>chrome.storage.local</code> — encrypted by the browser on disk. It is never hardcoded in source and never committed to the repository.</p>
+      </div>
+      <div class="security-card">
+        <h3>⚠️ Honest risk assessment</h3>
+        <p>The extension has access to all pages you visit (required for content scripts) and can read page content. Review the <a href="https://github.com/staimoorulhassan/Autologin_Extension" target="_blank">open source code</a> before use. Use for accounts you own and have authority to automate.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- INSTALL -->
+<section class="bg-white">
+  <div class="section-inner">
+    <div class="install-box">
+      <h2>Get started in 3 steps</h2>
+      <p>Download, load, and run your first batch in under 5 minutes.</p>
+      <div class="install-steps">
+        <div class="install-step">
+          <div class="num">1</div>
+          <div class="label">Download the release ZIP</div>
+        </div>
+        <div class="install-step">
+          <div class="num">2</div>
+          <div class="label">Load unpacked in Chrome or Firefox</div>
+        </div>
+        <div class="install-step">
+          <div class="num">3</div>
+          <div class="label">Import credentials &amp; Start</div>
+        </div>
+      </div>
+      <a href="https://github.com/staimoorulhassan/Autologin_Extension/releases" class="btn btn-primary" style="font-size:15px; padding:14px 32px;">⬇ Download Latest Release</a>
+      <p style="margin-top:16px; font-size:13px; color:var(--muted);">
+        Or clone from <a href="https://github.com/staimoorulhassan/Autologin_Extension">GitHub</a> and run <code>npm run build</code>
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <p>
+    AutoLogin — open source browser extension &nbsp;·&nbsp;
+    <a href="https://github.com/staimoorulhassan/Autologin_Extension" target="_blank">GitHub</a> &nbsp;·&nbsp;
+    <a href="https://github.com/staimoorulhassan/Autologin_Extension/blob/main/README.md" target="_blank">Documentation</a> &nbsp;·&nbsp;
+    Use responsibly and only on accounts you own.
+  </p>
+</footer>
+
 </body>
 </html>

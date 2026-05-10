@@ -1,7 +1,7 @@
 {
-  "outputDirectory": "dist",
+  "public": "dist",
+  "cleanUrls": false,
   "rewrites": [
-    { "source": "/", "destination": "/popup.html" },
-    { "source": "/(.*)", "destination": "/$1" }
+    { "source": "/", "destination": "/popup.html" }
   ]
 }

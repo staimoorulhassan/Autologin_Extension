@@ -1,0 +1,7 @@
+{
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/", "destination": "/popup.html" },
+    { "source": "/(.*)", "destination": "/$1" }
+  ]
+}

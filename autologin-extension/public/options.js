@@ -317,26 +317,55 @@ async function clearAllData() {
 }
 
 /**
- * Load and display saved API key status
+ * Load and display saved API key statuses
  */
 function loadApiKey() {
-  chrome.storage.local.get('openrouter_api_key', (result) => {
-    const key = result['openrouter_api_key'] || '';
+  chrome.storage.local.get(['pollinations_api_key', 'openrouter_api_key'], (result) => {
+    const pollinationsKey = result['pollinations_api_key'] || '';
+    const pollinationsInput = document.getElementById('pollinationsKeyInput');
+    const pollinationsStatus = document.getElementById('pollinationsKeyStatus');
+    if (pollinationsKey) {
+      pollinationsInput.value = pollinationsKey;
+      pollinationsStatus.textContent = '✅ Pollinations key saved';
+      pollinationsStatus.style.color = '#155724';
+    } else {
+      pollinationsStatus.textContent = '⚠️ No Pollinations key — will use OpenRouter fallback';
+      pollinationsStatus.style.color = '#856404';
+    }
+
+    const openrouterKey = result['openrouter_api_key'] || '';
     const input = document.getElementById('apiKeyInput');
     const status = document.getElementById('apiKeyStatus');
-    if (key) {
-      input.value = key;
-      status.textContent = '✅ API key saved';
+    if (openrouterKey) {
+      input.value = openrouterKey;
+      status.textContent = '✅ OpenRouter key saved';
       status.style.color = '#155724';
     } else {
-      status.textContent = '⚠️ No API key set — AI page analysis disabled';
+      status.textContent = '⚠️ No OpenRouter key — set at least one key to enable AI';
       status.style.color = '#856404';
     }
   });
 }
 
 /**
- * Save API key to storage
+ * Save Pollinations API key
+ */
+function savePollinationsKey() {
+  const key = document.getElementById('pollinationsKeyInput').value.trim();
+  const status = document.getElementById('pollinationsKeyStatus');
+  if (!key) {
+    status.textContent = '❌ Please enter a key';
+    status.style.color = '#721c24';
+    return;
+  }
+  chrome.storage.local.set({ pollinations_api_key: key }, () => {
+    status.textContent = '✅ Pollinations key saved';
+    status.style.color = '#155724';
+  });
+}
+
+/**
+ * Save OpenRouter API key
  */
 function saveApiKey() {
   const key = document.getElementById('apiKeyInput').value.trim();
@@ -347,7 +376,7 @@ function saveApiKey() {
     return;
   }
   chrome.storage.local.set({ openrouter_api_key: key }, () => {
-    status.textContent = '✅ API key saved';
+    status.textContent = '✅ OpenRouter key saved';
     status.style.color = '#155724';
   });
 }
@@ -362,12 +391,27 @@ document.addEventListener('DOMContentLoaded', () => {
   const clearBtn = document.getElementById('clearBtn');
   const clearDataBtn = document.getElementById('clearDataBtn');
   const backLink = document.getElementById('backLink');
+  const savePollinationsKeyBtn = document.getElementById('savePollinationsKeyBtn');
+  const togglePollinationsKey = document.getElementById('togglePollinationsKey');
+  const pollinationsKeyInput = document.getElementById('pollinationsKeyInput');
   const saveApiKeyBtn = document.getElementById('saveApiKeyBtn');
   const toggleApiKey = document.getElementById('toggleApiKey');
   const apiKeyInput = document.getElementById('apiKeyInput');
 
-  // Load saved API key on open
+  // Load saved API keys on open
   loadApiKey();
+
+  if (savePollinationsKeyBtn) {
+    savePollinationsKeyBtn.addEventListener('click', savePollinationsKey);
+  }
+
+  if (togglePollinationsKey && pollinationsKeyInput) {
+    togglePollinationsKey.addEventListener('click', () => {
+      const isPassword = pollinationsKeyInput.type === 'password';
+      pollinationsKeyInput.type = isPassword ? 'text' : 'password';
+      togglePollinationsKey.textContent = isPassword ? 'Hide' : 'Show';
+    });
+  }
 
   if (saveApiKeyBtn) {
     saveApiKeyBtn.addEventListener('click', saveApiKey);

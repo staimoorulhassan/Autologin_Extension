@@ -7,9 +7,9 @@
 import type { Credential, LoginStatus } from '@/types/index';
 
 const AI_CONFIG = {
-  // Primary: Pollinations — free, no key, OpenAI-compatible
+  // Primary: Pollinations — OpenAI-compatible, requires API key
   pollinations: {
-    baseUrl: 'https://text.pollinations.ai/openai',
+    baseUrl: 'https://gen.pollinations.ai/v1',
     visionModel: 'openai',       // GPT-4o based, supports image input
     textModel: 'openai',
   },
@@ -27,11 +27,14 @@ const AI_CONFIG = {
   timeout: 45000
 };
 
-/** Load OpenRouter API key from storage — only used when Pollinations fails. */
-async function getApiKey(): Promise<string> {
+/** Load API keys from storage. */
+async function getApiKeys(): Promise<{ pollinations: string; openrouter: string }> {
   return new Promise((resolve) => {
-    chrome.storage.local.get('openrouter_api_key', (result) => {
-      resolve((result['openrouter_api_key'] as string) || '');
+    chrome.storage.local.get(['pollinations_api_key', 'openrouter_api_key'], (result) => {
+      resolve({
+        pollinations: (result['pollinations_api_key'] as string) || '',
+        openrouter: (result['openrouter_api_key'] as string) || '',
+      });
     });
   });
 }
@@ -310,7 +313,7 @@ async function tryVisionEndpoint(
 }
 
 /**
- * Call AI with vision — tries Pollinations first (no key), falls back to OpenRouter.
+ * Call AI with vision — tries Pollinations first, falls back to OpenRouter.
  */
 async function callAIWithVision(
   prompt: string,
@@ -318,33 +321,37 @@ async function callAIWithVision(
 ): Promise<{ success: boolean; content?: string; error?: string }> {
   const base64Data = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
   const errors: string[] = [];
+  const keys = await getApiKeys();
 
-  // 1. Try Pollinations (primary — free, no key required)
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
-    const result = await tryVisionEndpoint(
-      AI_CONFIG.pollinations.baseUrl,
-      AI_CONFIG.pollinations.visionModel,
-      prompt, base64Data, controller.signal
-    );
-    clearTimeout(timeoutId);
-    if (result.success) {
-      console.log('AutoLogin AI: Used Pollinations (primary)');
-      return result;
+  // 1. Try Pollinations (primary)
+  if (keys.pollinations) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
+      const result = await tryVisionEndpoint(
+        AI_CONFIG.pollinations.baseUrl,
+        AI_CONFIG.pollinations.visionModel,
+        prompt, base64Data, controller.signal, keys.pollinations
+      );
+      clearTimeout(timeoutId);
+      if (result.success) {
+        console.log('AutoLogin AI: Used Pollinations (primary)');
+        return result;
+      }
+      errors.push(`pollinations: ${result.error}`);
+      console.warn('AutoLogin AI: Pollinations failed, trying OpenRouter...', result.error);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`pollinations: ${msg}`);
+      console.warn('AutoLogin AI: Pollinations threw:', msg);
     }
-    errors.push(`pollinations: ${result.error}`);
-    console.warn('AutoLogin AI: Pollinations failed, trying OpenRouter...', result.error);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`pollinations: ${msg}`);
-    console.warn('AutoLogin AI: Pollinations threw:', msg);
+  } else {
+    errors.push('pollinations: no API key set');
   }
 
-  // 2. Fall back to OpenRouter free models (needs API key)
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    return { success: false, error: `Pollinations failed and no OpenRouter API key set. Errors: ${errors.join(' | ')}` };
+  // 2. Fall back to OpenRouter
+  if (!keys.openrouter) {
+    return { success: false, error: `No API keys configured. Set a Pollinations or OpenRouter key in Options. Errors: ${errors.join(' | ')}` };
   }
 
   for (const model of AI_CONFIG.openrouter.visionModels) {
@@ -353,7 +360,7 @@ async function callAIWithVision(
     try {
       const result = await tryVisionEndpoint(
         AI_CONFIG.openrouter.baseUrl,
-        model, prompt, base64Data, controller.signal, apiKey
+        model, prompt, base64Data, controller.signal, keys.openrouter
       );
       clearTimeout(timeoutId);
       if (result.success) {
@@ -379,45 +386,51 @@ async function callAIWithVision(
 async function callAIText(
   prompt: string
 ): Promise<{ success: boolean; content?: string; error?: string }> {
-  // 1. Try Pollinations (primary — free, no key)
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
+  const keys = await getApiKeys();
 
-    const response = await fetch(`${AI_CONFIG.pollinations.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: AI_CONFIG.pollinations.textModel,
-        messages: [
-          { role: 'system', content: 'You are a login troubleshooting expert. Respond in JSON format only.' },
-          { role: 'user', content: prompt }
-        ],
-        temperature: 0.3,
-        max_tokens: 600
-      }),
-      signal: controller.signal
-    });
+  // 1. Try Pollinations (primary)
+  if (keys.pollinations) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
 
-    clearTimeout(timeoutId);
+      const response = await fetch(`${AI_CONFIG.pollinations.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${keys.pollinations}`
+        },
+        body: JSON.stringify({
+          model: AI_CONFIG.pollinations.textModel,
+          messages: [
+            { role: 'system', content: 'You are a login troubleshooting expert. Respond in JSON format only.' },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.3,
+          max_tokens: 600
+        }),
+        signal: controller.signal
+      });
 
-    if (response.ok) {
-      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      const content = data.choices?.[0]?.message?.content || '';
-      if (content) {
-        console.log('AutoLogin AI: Text via Pollinations (primary)');
-        return { success: true, content };
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+        const content = data.choices?.[0]?.message?.content || '';
+        if (content) {
+          console.log('AutoLogin AI: Text via Pollinations (primary)');
+          return { success: true, content };
+        }
       }
+      console.warn('AutoLogin AI: Pollinations text failed, trying OpenRouter...');
+    } catch (err) {
+      console.warn('AutoLogin AI: Pollinations text threw:', err instanceof Error ? err.message : String(err));
     }
-    console.warn('AutoLogin AI: Pollinations text failed, trying OpenRouter...');
-  } catch (err) {
-    console.warn('AutoLogin AI: Pollinations text threw:', err instanceof Error ? err.message : String(err));
   }
 
   // 2. Fall back to OpenRouter
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    return { success: false, error: 'OpenRouter API key not set.' };
+  if (!keys.openrouter) {
+    return { success: false, error: 'No API keys configured. Set a Pollinations or OpenRouter key in Options.' };
   }
 
   try {
@@ -428,7 +441,7 @@ async function callAIText(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+        'Authorization': `Bearer ${keys.openrouter}`,
         'HTTP-Referer': 'https://autologin-extension',
         'X-Title': 'AutoLogin Extension'
       },

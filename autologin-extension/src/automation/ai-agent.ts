@@ -1,27 +1,33 @@
 /**
  * AI Login Agent
- * Uses OpenRouter free-tier vision models to:
- * - Analyze page screenshots and identify form field selectors
- * - Detect and solve text-based CAPTCHAs from screenshots
- * - Diagnose login failures
+ * Primary: Pollinations AI (free, no API key required)
+ * Fallback: OpenRouter free-tier vision models (requires API key in options)
  */
 
 import type { Credential, LoginStatus } from '@/types/index';
 
 const AI_CONFIG = {
-  baseUrl: 'https://openrouter.ai/api/v1',
-  // Free vision models in priority order — reliable first, then higher-quality
-  visionModels: [
-    'baidu/qianfan-ocr-fast:free',
-    'google/gemma-4-31b-it:free',
-    'google/gemma-4-26b-a4b-it:free',
-    'nvidia/nemotron-nano-12b-v2-vl:free',
-  ],
-  textModel: 'baidu/qianfan-ocr-fast:free',
+  // Primary: Pollinations — free, no key, OpenAI-compatible
+  pollinations: {
+    baseUrl: 'https://text.pollinations.ai/openai',
+    visionModel: 'openai',       // GPT-4o based, supports image input
+    textModel: 'openai',
+  },
+  // Fallback: OpenRouter free tier — requires API key in extension options
+  openrouter: {
+    baseUrl: 'https://openrouter.ai/api/v1',
+    visionModels: [
+      'baidu/qianfan-ocr-fast:free',
+      'google/gemma-4-31b-it:free',
+      'google/gemma-4-26b-a4b-it:free',
+      'nvidia/nemotron-nano-12b-v2-vl:free',
+    ],
+    textModel: 'baidu/qianfan-ocr-fast:free',
+  },
   timeout: 45000
 };
 
-/** Load API key from storage at runtime — never hardcoded in source. */
+/** Load OpenRouter API key from storage — only used when Pollinations fails. */
 async function getApiKey(): Promise<string> {
   return new Promise((resolve) => {
     chrome.storage.local.get('openrouter_api_key', (result) => {
@@ -257,23 +263,26 @@ export function logAIInteraction(
 }
 
 /**
- * Try a single OpenRouter model with vision input.
+ * Call a single vision endpoint (OpenAI-compatible format).
  */
-async function tryVisionModel(
+async function tryVisionEndpoint(
+  baseUrl: string,
   model: string,
   prompt: string,
   base64Data: string,
-  apiKey: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  apiKey?: string
 ): Promise<{ success: boolean; content?: string; error?: string }> {
-  const response = await fetch(`${AI_CONFIG.baseUrl}/chat/completions`, {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+    headers['HTTP-Referer'] = 'https://autologin-extension';
+    headers['X-Title'] = 'AutoLogin Extension';
+  }
+
+  const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-      'HTTP-Referer': 'https://autologin-extension',
-      'X-Title': 'AutoLogin Extension'
-    },
+    headers,
     body: JSON.stringify({
       model,
       messages: [{
@@ -301,30 +310,54 @@ async function tryVisionModel(
 }
 
 /**
- * Call OpenRouter with a screenshot — tries free vision models in order until one succeeds.
+ * Call AI with vision — tries Pollinations first (no key), falls back to OpenRouter.
  */
 async function callAIWithVision(
   prompt: string,
   imageBase64: string
 ): Promise<{ success: boolean; content?: string; error?: string }> {
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    return { success: false, error: 'OpenRouter API key not set. Open extension options to configure it.' };
-  }
-
   const base64Data = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
   const errors: string[] = [];
 
-  for (const model of AI_CONFIG.visionModels) {
+  // 1. Try Pollinations (primary — free, no key required)
+  try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
+    const result = await tryVisionEndpoint(
+      AI_CONFIG.pollinations.baseUrl,
+      AI_CONFIG.pollinations.visionModel,
+      prompt, base64Data, controller.signal
+    );
+    clearTimeout(timeoutId);
+    if (result.success) {
+      console.log('AutoLogin AI: Used Pollinations (primary)');
+      return result;
+    }
+    errors.push(`pollinations: ${result.error}`);
+    console.warn('AutoLogin AI: Pollinations failed, trying OpenRouter...', result.error);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`pollinations: ${msg}`);
+    console.warn('AutoLogin AI: Pollinations threw:', msg);
+  }
 
+  // 2. Fall back to OpenRouter free models (needs API key)
+  const apiKey = await getApiKey();
+  if (!apiKey) {
+    return { success: false, error: `Pollinations failed and no OpenRouter API key set. Errors: ${errors.join(' | ')}` };
+  }
+
+  for (const model of AI_CONFIG.openrouter.visionModels) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
     try {
-      const result = await tryVisionModel(model, prompt, base64Data, apiKey, controller.signal);
+      const result = await tryVisionEndpoint(
+        AI_CONFIG.openrouter.baseUrl,
+        model, prompt, base64Data, controller.signal, apiKey
+      );
       clearTimeout(timeoutId);
-
       if (result.success) {
-        console.log(`AutoLogin AI: Used model ${model}`);
+        console.log(`AutoLogin AI: Used OpenRouter fallback model ${model}`);
         return result;
       }
       errors.push(result.error || 'unknown error');
@@ -337,15 +370,51 @@ async function callAIWithVision(
     }
   }
 
-  return { success: false, error: `All vision models failed: ${errors.join(' | ')}` };
+  return { success: false, error: `All vision providers failed: ${errors.join(' | ')}` };
 }
 
 /**
- * Call OpenRouter text model (no vision).
+ * Call AI text model — tries Pollinations first, falls back to OpenRouter.
  */
 async function callAIText(
   prompt: string
 ): Promise<{ success: boolean; content?: string; error?: string }> {
+  // 1. Try Pollinations (primary — free, no key)
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
+
+    const response = await fetch(`${AI_CONFIG.pollinations.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: AI_CONFIG.pollinations.textModel,
+        messages: [
+          { role: 'system', content: 'You are a login troubleshooting expert. Respond in JSON format only.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.3,
+        max_tokens: 600
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const content = data.choices?.[0]?.message?.content || '';
+      if (content) {
+        console.log('AutoLogin AI: Text via Pollinations (primary)');
+        return { success: true, content };
+      }
+    }
+    console.warn('AutoLogin AI: Pollinations text failed, trying OpenRouter...');
+  } catch (err) {
+    console.warn('AutoLogin AI: Pollinations text threw:', err instanceof Error ? err.message : String(err));
+  }
+
+  // 2. Fall back to OpenRouter
   const apiKey = await getApiKey();
   if (!apiKey) {
     return { success: false, error: 'OpenRouter API key not set.' };
@@ -355,7 +424,7 @@ async function callAIText(
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
 
-    const response = await fetch(`${AI_CONFIG.baseUrl}/chat/completions`, {
+    const response = await fetch(`${AI_CONFIG.openrouter.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -364,7 +433,7 @@ async function callAIText(
         'X-Title': 'AutoLogin Extension'
       },
       body: JSON.stringify({
-        model: AI_CONFIG.textModel,
+        model: AI_CONFIG.openrouter.textModel,
         messages: [
           { role: 'system', content: 'You are a login troubleshooting expert. Respond in JSON format only.' },
           { role: 'user', content: prompt }

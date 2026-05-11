@@ -18,7 +18,8 @@ import {
   CaptureScreenshotResponse,
   GetPageInfoResponse,
   LogoutPageResponse,
-  CheckLoginStatusResponse
+  CheckLoginStatusResponse,
+  ExecuteDomActionResponse
 } from '@messaging/index';
 
 console.log('AutoLogin: Content script loaded on', window.location.href);
@@ -702,7 +703,7 @@ registerHandler(MESSAGE_TYPES.CHECK_LOGIN_STATUS, async (rawData, _sender) => {
 
     // STRICT SUCCESS: URL must have changed to a different domain OR different path (not just login → auth)
     // Require BOTH: not on login page AND URL actually changed
-    const loginPathPatterns = ['/login', '/signin', '/sign-in', '/auth', '/log-in', '/accounts'];
+    const loginPathPatterns = ['/login', '/signin', '/sign-in', '/sign_in', '/auth', '/log-in', '/accounts'];
     const isCurrentlyOnLoginPath = loginPathPatterns.some(p =>
       currentPathname.toLowerCase().includes(p)
     );
@@ -785,7 +786,17 @@ registerHandler(MESSAGE_TYPES.CHECK_LOGIN_STATUS, async (rawData, _sender) => {
       });
     }
 
-    // Default: still in progress
+    // If the URL didn't change and we're still on a login-type path, it's a failed login
+    if (!urlChanged && isCurrentlyOnLoginPath) {
+      return createResponse<CheckLoginStatusResponse>({
+        status: 'WRONG_PASSWORD',
+        urlChanged,
+        currentUrl,
+        errorText: 'Login failed — page did not navigate away from login'
+      });
+    }
+
+    // Default: still in progress (navigation pending or unknown state)
     return createResponse<CheckLoginStatusResponse>({
       status: 'IN_PROGRESS',
       urlChanged,
@@ -855,6 +866,70 @@ registerHandler(MESSAGE_TYPES.LOGOUT_PAGE, async (rawData, _sender) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     return createErrorResponse(`Logout error: ${message}`);
+  }
+});
+
+/**
+ * EXECUTE_DOM_ACTION: Universal action executor for per-step AI orchestration.
+ * Replaces the fill+submit split with a single general-purpose action.
+ */
+registerHandler(MESSAGE_TYPES.EXECUTE_DOM_ACTION, async (rawData, _sender) => {
+  try {
+    const data = cd<{ action?: 'type' | 'click'; selector?: string; value?: string }>(rawData);
+    if (!data?.action || !data?.selector) {
+      return createErrorResponse('Missing required fields: action, selector');
+    }
+
+    const el = document.querySelector(data.selector) as HTMLElement | null;
+    if (!el) {
+      return createResponse<ExecuteDomActionResponse>({ executed: false, error: `Element not found: ${data.selector}` });
+    }
+
+    if (data.action === 'type') {
+      const input = el as HTMLInputElement;
+      const value = data.value ?? '';
+
+      // Focus and select-all so execCommand replaces any existing content
+      input.focus();
+      input.select();
+
+      // Primary: execCommand('insertText') fires the browser-native edit-command chain
+      // that React/Vue/Angular synthetic event systems intercept — this is the only
+      // approach that reliably updates React controlled inputs without needing
+      // access to the internal fiber.
+      const ok = document.execCommand('insertText', false, value);
+
+      if (!ok) {
+        // Fallback for non-framework or SSR-rendered inputs: native prototype setter
+        // bypasses React's property descriptor override, then fire InputEvent so
+        // React's onChange fires on the correct value.
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value'
+        )?.set;
+        if (nativeSetter) nativeSetter.call(input, value);
+        else input.value = value;
+
+        input.dispatchEvent(new InputEvent('input', {
+          bubbles: true, cancelable: true, inputType: 'insertText', data: value
+        }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      // Verify the value was actually set; log a warning if not (helps diagnose)
+      if (input.value !== value) {
+        console.warn(`AutoLogin: type action wrote "${value}" but field reads "${input.value}" — selector: ${data.selector}`);
+      }
+
+      console.log(`AutoLogin: Typed ${value.length} chars into ${data.selector} (execCommand=${ok})`);
+    } else {
+      el.click();
+      console.log(`AutoLogin: Clicked ${data.selector}`);
+    }
+
+    return createResponse<ExecuteDomActionResponse>({ executed: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return createErrorResponse(`EXECUTE_DOM_ACTION error: ${message}`);
   }
 });
 

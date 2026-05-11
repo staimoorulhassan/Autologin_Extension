@@ -40,7 +40,8 @@ export type BackgroundMessageType =
   | 'RESUME_BATCH_LOGIN'
   | 'GET_BATCH_STATUS'
   | 'DEV_GET_LOGS'
-  | 'DEV_CLEAR_DATA';
+  | 'DEV_CLEAR_DATA'
+  | 'USER_INSTRUCTION';
 
 /**
  * All message types that can be sent to the content script
@@ -55,7 +56,8 @@ export type ContentMessageType =
   | 'CAPTURE_SCREENSHOT'
   | 'GET_PAGE_INFO'
   | 'LOGOUT_PAGE'
-  | 'CHECK_LOGIN_STATUS';
+  | 'CHECK_LOGIN_STATUS'
+  | 'EXECUTE_DOM_ACTION';
 
 /**
  * Message type constants (avoid magic strings)
@@ -83,6 +85,7 @@ export const MESSAGE_TYPES = {
   GET_BATCH_STATUS: 'GET_BATCH_STATUS',
   DEV_GET_LOGS: 'DEV_GET_LOGS',
   DEV_CLEAR_DATA: 'DEV_CLEAR_DATA',
+  USER_INSTRUCTION: 'USER_INSTRUCTION',
 
   // Content handlers
   DETECT_FORM: 'DETECT_FORM',
@@ -93,7 +96,8 @@ export const MESSAGE_TYPES = {
   CAPTURE_SCREENSHOT: 'CAPTURE_SCREENSHOT',
   GET_PAGE_INFO: 'GET_PAGE_INFO',
   LOGOUT_PAGE: 'LOGOUT_PAGE',
-  CHECK_LOGIN_STATUS: 'CHECK_LOGIN_STATUS'
+  CHECK_LOGIN_STATUS: 'CHECK_LOGIN_STATUS',
+  EXECUTE_DOM_ACTION: 'EXECUTE_DOM_ACTION'
 } as const;
 
 // ============================================================================
@@ -198,6 +202,11 @@ export interface DevClearDataMessage {
   type: 'DEV_CLEAR_DATA';
 }
 
+export interface UserInstructionMessage {
+  type: 'USER_INSTRUCTION';
+  data: { instruction: string };
+}
+
 /**
  * Union of all background messages
  */
@@ -221,7 +230,8 @@ export type BackgroundMessage =
   | ResumeBatchLoginMessage
   | GetBatchStatusMessage
   | DevGetLogsMessage
-  | DevClearDataMessage;
+  | DevClearDataMessage
+  | UserInstructionMessage;
 
 // ============================================================================
 // Content Messages (background → content)
@@ -286,6 +296,11 @@ export interface CheckLoginStatusMessage {
   data: { originalUrl: string };
 }
 
+export interface ExecuteDomActionMessage {
+  type: 'EXECUTE_DOM_ACTION';
+  data: { action: 'type' | 'click'; selector: string; value?: string };
+}
+
 /**
  * Union of all content messages
  */
@@ -298,7 +313,8 @@ export type ContentMessage =
   | CaptureScreenshotMessage
   | GetPageInfoMessage
   | LogoutPageMessage
-  | CheckLoginStatusMessage;
+  | CheckLoginStatusMessage
+  | ExecuteDomActionMessage;
 
 // ============================================================================
 // Response Types
@@ -379,7 +395,11 @@ export interface BatchProgress {
   completed: number;
   current?: string;
   currentUrl?: string;
-  status: 'idle' | 'running' | 'paused' | 'stopped' | 'done';
+  status: 'idle' | 'running' | 'paused' | 'stopped' | 'done' | 'waiting_instruction' | 'captcha_pause';
+  // AI orchestration fields
+  aiCommentary?: string;
+  escalationReason?: string;
+  escalationHostname?: string;
 }
 
 export interface StartBatchLoginResponse {
@@ -402,6 +422,15 @@ export interface DevGetLogsResponse {
 
 export interface DevClearDataResponse {
   cleared: boolean;
+}
+
+export interface UserInstructionResponse {
+  resumed: boolean;
+}
+
+export interface ExecuteDomActionResponse {
+  executed: boolean;
+  error?: string;
 }
 
 export interface DetectFormResponse {
@@ -486,6 +515,7 @@ export interface MessageResponseMap {
   GET_BATCH_STATUS: GetBatchStatusResponse;
   DEV_GET_LOGS: DevGetLogsResponse;
   DEV_CLEAR_DATA: DevClearDataResponse;
+  USER_INSTRUCTION: UserInstructionResponse;
   DETECT_FORM: DetectFormResponse;
   FILL_FORM: FillFormResponse;
   SUBMIT_FORM: SubmitFormResponse;
@@ -495,6 +525,7 @@ export interface MessageResponseMap {
   GET_PAGE_INFO: GetPageInfoResponse;
   LOGOUT_PAGE: LogoutPageResponse;
   CHECK_LOGIN_STATUS: CheckLoginStatusResponse;
+  EXECUTE_DOM_ACTION: ExecuteDomActionResponse;
 }
 
 // ============================================================================

@@ -1,6 +1,12 @@
 /**
- * Background Service Worker
- * Handles: Message routing, database operations, session management, logging
+ * Background Service Worker — AI Orchestration Architecture
+ *
+ * Batch flow:
+ *   1. Credentials grouped by hostname (all accounts for same site together)
+ *   2. Tab opened ACTIVE so captureVisibleTab/captureTab works
+ *   3. Per-step AI loop: screenshot → decideNextAction → execute → checkpoint → repeat
+ *   4. After 3 consecutive failures on a hostname: pause, ask user for instruction
+ *   5. First success on a hostname → save selector template for remaining accounts
  */
 
 import {
@@ -29,13 +35,22 @@ import {
 
 import { credentialStore, logStore, cookieStore, dbUtils } from '@store/database';
 import type { Cookie, LoginStatus } from 'src/types/index';
-import { analyzeLoginFailure, analyzePageForLogin, solveCaptcha, logAIInteraction, type LoginContext } from '@automation/ai-agent';
+import {
+  analyzeLoginFailure,
+  logAIInteraction,
+  decideNextAction,
+  getSiteHintsForUrl,
+  type LoginContext,
+  type LoginTemplate,
+  type ActionContext
+} from '@automation/ai-agent';
 
-console.log('AutoLogin: Background worker loaded');
+console.log('AutoLogin: Background worker loaded (orchestration architecture)');
 
-/**
- * Track login state across tabs
- */
+// ============================================================================
+// Types
+// ============================================================================
+
 interface LoginState {
   accountId: string;
   startTime: number;
@@ -45,49 +60,84 @@ interface LoginState {
 
 const loginState = new Map<string, LoginState>();
 
-/**
- * Batch login state for sequential credential processing
- */
-interface BatchState {
-  credentials: Array<{ id: string; url: string; username: string; password: string }>;
+interface OrchestratorAccount {
+  id: string;
+  url: string;
+  username: string;
+  password: string;
+  hostname: string;
+}
+
+interface StepRecord {
+  action: string;
+  selector?: string;
+  fieldType?: string;
+  commentary: string;
+  result: 'ok' | 'failed';
+  timestamp: number;
+}
+
+interface OrchestratorState {
+  status: 'idle' | 'running' | 'waiting_instruction' | 'captcha_pause' | 'done' | 'stopped';
+  accounts: OrchestratorAccount[];
   currentIndex: number;
   total: number;
-  status: 'running' | 'paused' | 'stopped' | 'done' | 'idle';
-  delayBetweenMs: number;
   currentTabId?: number;
   startedAt: number;
+  delayBetweenMs: number;
+  templates: Record<string, LoginTemplate>;
+  hostnameFailures: Record<string, number>;
+  currentSteps: StepRecord[];
+  escalation?: { hostname: string; reason: string };
+  pendingInstruction?: string;
 }
 
-// Use storage.local for batch state (storage.session not available in older @types/chrome)
-const storageArea = chrome.storage.local;
-
-async function getBatchState(): Promise<BatchState | null> {
-  const result = await storageArea.get('batchState');
-  return (result['batchState'] as BatchState) ?? null;
+interface AiFeedEntry {
+  id: string;
+  accountId: string;
+  username: string;
+  hostname: string;
+  commentary: string;
+  action: string;
+  timestamp: number;
 }
 
-async function setBatchState(state: BatchState | null): Promise<void> {
+// ============================================================================
+// State storage
+// ============================================================================
+
+async function getOrchestratorState(): Promise<OrchestratorState | null> {
+  const r = await chrome.storage.local.get('orchestratorState');
+  return (r['orchestratorState'] as OrchestratorState) ?? null;
+}
+
+async function setOrchestratorState(state: OrchestratorState | null): Promise<void> {
   if (state === null) {
-    await storageArea.remove('batchState');
+    await chrome.storage.local.remove('orchestratorState');
   } else {
-    await storageArea.set({ batchState: state });
+    await chrome.storage.local.set({ orchestratorState: state });
   }
 }
 
-/**
- * Initialize extension on install/update
- */
+async function appendToAiFeed(entry: Omit<AiFeedEntry, 'id'>): Promise<void> {
+  const r = await chrome.storage.local.get('ai_feed');
+  const feed = (r['ai_feed'] as AiFeedEntry[]) ?? [];
+  const newEntry: AiFeedEntry = {
+    ...entry,
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  };
+  await chrome.storage.local.set({ ai_feed: [...feed, newEntry].slice(-120) });
+}
+
+// ============================================================================
+// Startup
+// ============================================================================
+
 chrome.runtime.onInstalled.addListener(async (details: chrome.runtime.InstalledDetails) => {
-  if (details.reason === 'install') {
-    console.log('AutoLogin: Extension installed');
-  } else if (details.reason === 'update') {
-    console.log('AutoLogin: Extension updated');
-  }
+  if (details.reason === 'install') console.log('AutoLogin: Extension installed');
+  else if (details.reason === 'update') console.log('AutoLogin: Extension updated');
 });
 
-/**
- * Main message router: dispatch all incoming messages to registered handlers
- */
 chrome.runtime.onMessage.addListener((
   message: Record<string, unknown>,
   sender: chrome.runtime.MessageSender,
@@ -97,34 +147,499 @@ chrome.runtime.onMessage.addListener((
   return dispatchMessage(message, sender, sendResponse);
 });
 
-/**
- * Alarm listener for batch login orchestration
- */
+// ============================================================================
+// Alarm — single tick drives the whole orchestration state machine
+// ============================================================================
+
 chrome.alarms.onAlarm.addListener(async (alarm: chrome.alarms.Alarm) => {
-  if (alarm.name === 'batch_next_credential') {
-    await processNextCredential();
+  if (alarm.name !== 'batch_tick') return;
+
+  const state = await getOrchestratorState();
+  if (!state || state.status !== 'running') return;
+
+  if (state.currentIndex >= state.total) {
+    await setOrchestratorState({ ...state, status: 'done' });
+    return;
+  }
+
+  if (state.currentTabId !== undefined) {
+    await executeOrchestrationStep();
+  } else {
+    await startNextAccount();
   }
 });
 
-// Type-safe data accessor for message handlers (data is typed as {} in generic handlers)
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let stabilityTimer: ReturnType<typeof setTimeout> | null = null;
+    const mainTimer = setTimeout(() => { cleanup(); resolve(); }, timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(mainTimer);
+      if (stabilityTimer) clearTimeout(stabilityTimer);
+      chrome.tabs.onUpdated.removeListener(listener);
+    };
+
+    const listener = (updatedId: number, info: { status?: string }) => {
+      if (updatedId !== tabId) return;
+      if (stabilityTimer) clearTimeout(stabilityTimer);
+      if (info.status === 'complete') {
+        stabilityTimer = setTimeout(() => { cleanup(); resolve(); }, 800);
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function captureTabScreenshot(tabId: number): Promise<string | null> {
+  try {
+    // Firefox: captureTab captures any tab by ID regardless of focus state — use it directly.
+    const gBrowser = (globalThis as Record<string, unknown>)['browser'] as
+      | { tabs?: { captureTab?: (id: number, opts: object) => Promise<string> } }
+      | undefined;
+    if (gBrowser?.tabs?.captureTab) {
+      return await gBrowser.tabs.captureTab(tabId, { format: 'jpeg', quality: 80 });
+    }
+
+    // Chrome: captureVisibleTab ONLY captures the currently active tab in the window.
+    // Re-activate the tab and focus its window before capturing, otherwise any tab
+    // that stole focus (e.g. the popup, another tab) would cause this to fail silently.
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.windowId) return null;
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+    await new Promise(r => setTimeout(r, 300));   // wait for render
+
+    return await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 80 });
+  } catch (error) {
+    console.error('AutoLogin: Screenshot failed:', error);
+    return null;
+  }
+}
+
+type SaveableCookie = { name: string; value: string; domain: string; path: string; expirationDate?: number; expires?: number };
+
+async function saveSuccessToFile(
+  url: string, username: string, password: string,
+  cookies: SaveableCookie[], timestamp: string | number | undefined
+): Promise<void> {
+  const hostname = new URL(url).hostname;
+  const ts = timestamp == null
+    ? new Date().toISOString()
+    : typeof timestamp === 'number' ? new Date(timestamp).toISOString() : String(timestamp);
+
+  const cookieLines = cookies.map(c => {
+    const expiry = c.expirationDate ?? (c.expires ? c.expires / 1000 : undefined);
+    return `Name: ${c.name}\nValue: ${c.value}\nDomain: ${c.domain}\nPath: ${c.path}\nExpires: ${expiry ? new Date(expiry * 1000).toISOString() : 'Session'}\n---`;
+  }).join('\n');
+
+  const content = [
+    '=== Login Success ===',
+    `URL: ${url}`, `Username: ${username}`, `Password: ${password}`, `Timestamp: ${ts}`,
+    '', '=== Cookies ===', cookieLines
+  ].join('\n');
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stored = await new Promise<any>(res => chrome.storage.local.get('successLog', res));
+    const log: object[] = stored['successLog'] || [];
+    log.push({ hostname, url, username, password, timestamp: ts, cookiesCount: cookies.length });
+    if (log.length > 100) log.shift();
+    await new Promise<void>(res => chrome.storage.local.set({ successLog: log }, res));
+  } catch { /* non-fatal */ }
+
+  try {
+    const blob = new Blob([content], { type: 'text/plain' });
+    const blobUrl = URL.createObjectURL(blob);
+    chrome.downloads.download(
+      { url: blobUrl, filename: `${hostname}-${username}-${Date.now()}.txt`, saveAs: false, conflictAction: 'overwrite' },
+      () => setTimeout(() => URL.revokeObjectURL(blobUrl), 1000)
+    );
+  } catch { /* expected in Firefox */ }
+}
+
+async function clearBrowserCookiesFor(url: string): Promise<void> {
+  const cookies = await new Promise<chrome.cookies.Cookie[]>(res => chrome.cookies.getAll({ url }, res));
+  for (const c of cookies) {
+    const scheme = c.secure ? 'https' : 'http';
+    const domain = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+    await new Promise<void>(res => chrome.cookies.remove({ url: `${scheme}://${domain}${c.path}`, name: c.name }, () => res()));
+  }
+}
+
 function d<T>(data: unknown): T { return data as T; }
 
-/**
- * ============================================================================
- * Credential Handlers
- * ============================================================================
- */
+// ============================================================================
+// Account grouping
+// ============================================================================
 
-/**
- * GET_CREDENTIALS: Retrieve all credentials for display in popup
- */
+function groupAndSort(
+  creds: Array<{ id: string; url: string; username: string; password: string }>
+): OrchestratorAccount[] {
+  const groups = new Map<string, OrchestratorAccount[]>();
+  for (const c of creds) {
+    let hostname: string;
+    try { hostname = new URL(c.url).hostname; } catch { hostname = c.url; }
+    if (!groups.has(hostname)) groups.set(hostname, []);
+    groups.get(hostname)!.push({ ...c, hostname });
+  }
+  const result: OrchestratorAccount[] = [];
+  for (const accs of groups.values()) result.push(...accs);
+  return result;
+}
+
+// ============================================================================
+// Core orchestration
+// ============================================================================
+
+async function startNextAccount(): Promise<void> {
+  const state = await getOrchestratorState();
+  if (!state || state.status !== 'running') return;
+
+  if (state.currentIndex >= state.total) {
+    await setOrchestratorState({ ...state, status: 'done' });
+    return;
+  }
+
+  const account = state.accounts[state.currentIndex];
+
+  // Close any leftover tab
+  if (state.currentTabId !== undefined) {
+    await chrome.tabs.remove(state.currentTabId).catch(() => {});
+  }
+
+  // Clear cookies
+  await clearBrowserCookiesFor(account.url).catch(() => {});
+  await new Promise(r => setTimeout(r, 500));
+
+  await appendToAiFeed({
+    accountId: account.id, username: account.username, hostname: account.hostname,
+    commentary: `Starting login for ${account.username} at ${account.hostname}`,
+    action: 'start', timestamp: Date.now()
+  });
+
+  // Open ACTIVE tab — required for captureVisibleTab
+  const tab = await new Promise<chrome.tabs.Tab>((res, rej) =>
+    chrome.tabs.create({ url: account.url, active: true }, t => {
+      if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
+      else res(t);
+    })
+  );
+
+  const tabId = tab.id!;
+
+  await setOrchestratorState({
+    ...state,
+    currentTabId: tabId,
+    currentSteps: [],
+    pendingInstruction: state.pendingInstruction
+  });
+
+  // Schedule BEFORE the long wait: if SW is killed during page load,
+  // the alarm fires ~27s later and executeOrchestrationStep re-reads state,
+  // sees the tab is open, takes a fresh screenshot, and continues.
+  chrome.alarms.create('batch_tick', { delayInMinutes: 0.45 });
+
+  await waitForTabComplete(tabId, 20000);
+  await new Promise(r => setTimeout(r, 1000));
+
+  // Still alive — replace safety-net with immediate tick
+  chrome.alarms.create('batch_tick', { delayInMinutes: 0.05 });
+}
+
+async function executeOrchestrationStep(): Promise<void> {
+  const state = await getOrchestratorState();
+  if (!state || state.status !== 'running' || state.currentTabId === undefined) return;
+
+  const account = state.accounts[state.currentIndex];
+  const tabId = state.currentTabId;
+
+  // Max steps guard — prevents infinite loops
+  if (state.currentSteps.length >= 18) {
+    await handleAccountResult(state, account, tabId, 'FORM_NOT_FOUND', 'Max steps (18) reached without success');
+    return;
+  }
+
+  // Check tab still exists (may be gone after SW restart)
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) {
+    await setOrchestratorState({ ...state, currentTabId: undefined });
+    chrome.alarms.create('batch_tick', { delayInMinutes: 0.05 });
+    return;
+  }
+
+  // Screenshot
+  const screenshot = await captureTabScreenshot(tabId);
+  if (!screenshot) {
+    await appendToAiFeed({
+      accountId: account.id, username: account.username, hostname: account.hostname,
+      commentary: 'Cannot capture screenshot — skipping this account',
+      action: 'error', timestamp: Date.now()
+    });
+    await handleAccountResult(state, account, tabId, 'FORM_NOT_FOUND', 'Screenshot unavailable');
+    return;
+  }
+
+  // Build AI context
+  const hints = await getSiteHintsForUrl(account.url);
+  const template = state.templates[account.hostname];
+  const context: ActionContext = {
+    username: account.username,
+    stepHistory: state.currentSteps,
+    hints,
+    template,
+    instruction: state.pendingInstruction
+  };
+
+  // Ask AI for next action
+  const currentUrl = tab.url ?? account.url;
+  const decision = await decideNextAction(screenshot, currentUrl, context);
+
+  if (!decision) {
+    await appendToAiFeed({
+      accountId: account.id, username: account.username, hostname: account.hostname,
+      commentary: 'AI unavailable — skipping',
+      action: 'error', timestamp: Date.now()
+    });
+    await handleAccountResult(state, account, tabId, 'FORM_NOT_FOUND', 'AI decision unavailable');
+    return;
+  }
+
+  // Write to feed
+  await appendToAiFeed({
+    accountId: account.id, username: account.username, hostname: account.hostname,
+    commentary: decision.commentary,
+    action: decision.action, timestamp: Date.now()
+  });
+
+  console.log(`AutoLogin AI [${account.username}@${account.hostname}]: ${decision.action} — ${decision.commentary}`);
+
+  // Terminal actions
+  if (decision.action === 'report_success') {
+    await handleAccountSuccess(state, account, tabId);
+    return;
+  }
+  if (decision.action === 'report_failure') {
+    await handleAccountResult(state, account, tabId, 'WRONG_PASSWORD', decision.commentary);
+    return;
+  }
+  if (decision.action === 'report_captcha') {
+    await handleCaptchaPause(state, account, tabId);
+    return;
+  }
+
+  // Execute action
+  let actionOk = false;
+  try {
+    if (decision.action === 'wait') {
+      await new Promise(r => setTimeout(r, decision.waitMs ?? 2000));
+      actionOk = true;
+    } else if ((decision.action === 'type' || decision.action === 'click') && decision.selector) {
+      // Schedule safety-net BEFORE long awaits: if SW dies during sendToContent (10s)
+      // or waitForTabComplete (12s), the alarm fires ~27s later and re-enters the step
+      // loop — fresh screenshot, AI re-evaluates from actual page state.
+      chrome.alarms.create('batch_tick', { delayInMinutes: 0.45 });
+
+      const resp = await sendToContent(tabId, {
+        type: MESSAGE_TYPES.EXECUTE_DOM_ACTION,
+        data: { action: decision.action, selector: decision.selector, value: decision.value }
+      }, 10000);
+      actionOk = resp.success && (resp.data as { executed?: boolean })?.executed !== false;
+      if (actionOk && decision.action === 'click') {
+        await waitForTabComplete(tabId, 12000);
+        await new Promise(r => setTimeout(r, 800));
+      }
+    }
+  } catch {
+    actionOk = false;
+  }
+
+  const step: StepRecord = {
+    action: decision.action,
+    selector: decision.selector,
+    fieldType: decision.fieldType,
+    commentary: decision.commentary,
+    result: actionOk ? 'ok' : 'failed',
+    timestamp: Date.now()
+  };
+
+  await setOrchestratorState({
+    ...state,
+    currentSteps: [...state.currentSteps, step],
+    pendingInstruction: undefined  // consumed
+  });
+
+  chrome.alarms.create('batch_tick', { delayInMinutes: 0.05 });
+}
+
+async function handleAccountSuccess(
+  state: OrchestratorState,
+  account: OrchestratorAccount,
+  tabId: number
+): Promise<void> {
+  console.log(`✅ AutoLogin: Success for ${account.username}@${account.hostname}`);
+
+  const liveCookies = await new Promise<chrome.cookies.Cookie[]>(res =>
+    chrome.cookies.getAll({ url: account.url }, res)
+  );
+
+  await saveSuccessToFile(account.url, account.username, account.password, liveCookies, new Date().toISOString())
+    .catch(e => console.warn('AutoLogin: File save failed:', e));
+
+  const dbCookies: Cookie[] = liveCookies.map(c => ({
+    account_id: account.id,
+    name: c.name, value: c.value, domain: c.domain, path: c.path,
+    expires: c.expirationDate ? c.expirationDate * 1000 : undefined,
+    httpOnly: c.httpOnly, secure: c.secure
+  }));
+  await cookieStore.saveCookies(account.id, dbCookies).catch(() => {});
+
+  // Save login template from this session's successful steps
+  const templateActions = state.currentSteps
+    .filter(s => (s.action === 'type' || s.action === 'click') && s.result === 'ok' && s.selector)
+    .map(s => ({ action: s.action as 'type' | 'click', selector: s.selector!, fieldType: s.fieldType ?? 'other' }));
+
+  const newTemplates = templateActions.length > 0
+    ? { ...state.templates, [account.hostname]: { actions: templateActions, savedAt: Date.now() } }
+    : state.templates;
+
+  if (templateActions.length > 0) {
+    console.log(`AutoLogin: Saved template for ${account.hostname} (${templateActions.length} steps)`);
+  }
+
+  // Reset failure count
+  const newFailures = { ...state.hostnameFailures, [account.hostname]: 0 };
+
+  await logStore.add({ account_id: account.id, status: 'SUCCESS', timestamp: Date.now() });
+
+  // Attempt logout (non-fatal)
+  await sendToContent(tabId, { type: MESSAGE_TYPES.LOGOUT_PAGE, data: { url: account.url } }, 5000)
+    .then(() => waitForTabComplete(tabId, 5000))
+    .catch(() => {});
+
+  await clearBrowserCookiesFor(account.url).catch(() => {});
+
+  await setOrchestratorState({
+    ...state,
+    templates: newTemplates,
+    hostnameFailures: newFailures,
+    currentIndex: state.currentIndex + 1,
+    currentTabId: undefined,
+    currentSteps: []
+  });
+
+  await chrome.tabs.remove(tabId).catch(() => {});
+
+  const delay = Math.max(state.delayBetweenMs, 3000);
+  chrome.alarms.create('batch_tick', { delayInMinutes: delay / 60000 });
+}
+
+async function handleAccountResult(
+  state: OrchestratorState,
+  account: OrchestratorAccount,
+  tabId: number,
+  status: string,
+  errorMsg: string
+): Promise<void> {
+  console.log(`❌ AutoLogin: ${status} for ${account.username}@${account.hostname}: ${errorMsg}`);
+
+  const prevFails = state.hostnameFailures[account.hostname] ?? 0;
+  const newFails = prevFails + 1;
+
+  await logStore.add({
+    account_id: account.id,
+    status: status as LoginStatus,
+    timestamp: Date.now(),
+    error_message: errorMsg
+  });
+
+  // Invoke background failure analysis
+  invokeAIForFailure(account, status, errorMsg).catch(() => {});
+
+  // Escalate after 3 consecutive failures on same hostname
+  if (newFails >= 3) {
+    console.log(`⚠️ AutoLogin: Escalating ${account.hostname} after ${newFails} failures`);
+    await appendToAiFeed({
+      accountId: account.id, username: account.username, hostname: account.hostname,
+      commentary: `3 consecutive failures on ${account.hostname}. Waiting for your instruction to continue.`,
+      action: 'escalate', timestamp: Date.now()
+    });
+    await setOrchestratorState({
+      ...state,
+      status: 'waiting_instruction',
+      hostnameFailures: { ...state.hostnameFailures, [account.hostname]: newFails },
+      escalation: { hostname: account.hostname, reason: errorMsg },
+      currentTabId: undefined,
+      currentSteps: []
+    });
+    await chrome.tabs.remove(tabId).catch(() => {});
+    return;
+  }
+
+  await setOrchestratorState({
+    ...state,
+    hostnameFailures: { ...state.hostnameFailures, [account.hostname]: newFails },
+    currentIndex: state.currentIndex + 1,
+    currentTabId: undefined,
+    currentSteps: []
+  });
+
+  await chrome.tabs.remove(tabId).catch(() => {});
+
+  const delay = Math.max(state.delayBetweenMs, 3000);
+  chrome.alarms.create('batch_tick', { delayInMinutes: delay / 60000 });
+}
+
+async function handleCaptchaPause(
+  state: OrchestratorState,
+  account: OrchestratorAccount,
+  tabId: number
+): Promise<void> {
+  console.log(`⏸️ AutoLogin: CAPTCHA pause for ${account.username}`);
+  await appendToAiFeed({
+    accountId: account.id, username: account.username, hostname: account.hostname,
+    commentary: 'CAPTCHA detected — solve it in the tab then click Continue',
+    action: 'captcha_pause', timestamp: Date.now()
+  });
+  await setOrchestratorState({ ...state, status: 'captcha_pause', currentTabId: tabId });
+  await chrome.storage.local.set({
+    captchaPause: { username: account.username, url: account.url, tabId, timestamp: Date.now() }
+  });
+}
+
+async function invokeAIForFailure(account: OrchestratorAccount, status: string, errorMsg: string): Promise<void> {
+  const context: LoginContext = {
+    credential: { url: account.url, username: account.username, password: account.password },
+    status: status as LoginStatus, error: errorMsg, pageUrl: account.url, attemptNumber: 1
+  };
+  const resp = await analyzeLoginFailure(context);
+  logAIInteraction(account.id, context, resp);
+  if (resp.success) {
+    await chrome.storage.local.set({
+      [`ai_insight_${account.id}`]: {
+        diagnosis: resp.diagnosis, recommendations: resp.recommendations,
+        shouldRetry: resp.shouldRetry, urgency: resp.urgency, confidence: resp.confidence,
+        timestamp: Date.now()
+      }
+    });
+  }
+}
+
+// ============================================================================
+// Credential CRUD Handlers (unchanged from previous version)
+// ============================================================================
+
 registerHandler(MESSAGE_TYPES.GET_CREDENTIALS, async (_data, _sender) => {
   try {
     const credentials = await credentialStore.getAll();
     return createResponse<GetCredentialsResponse>({ credentials });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to fetch credentials: ${message}`);
+    return createErrorResponse(`Failed to fetch credentials: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
@@ -135,31 +650,25 @@ registerHandler(MESSAGE_TYPES.ADD_CREDENTIAL, async (rawData, _sender) => {
       return createErrorResponse('Missing required fields: url, username, password');
     }
     const id = await credentialStore.add({
-      url: data.url,
-      username: data.username,
-      password: data.password || data.password_encrypted || '',
-      notes: data.notes
+      url: data.url, username: data.username,
+      password: data.password || data.password_encrypted || '', notes: data.notes
     });
     return createResponse({ id, success: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to add credential: ${message}`);
+    return createErrorResponse(`Failed to add credential: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
 registerHandler(MESSAGE_TYPES.UPDATE_CREDENTIAL, async (rawData, _sender) => {
   try {
     const data = d<{ id?: string | number; updates?: Record<string, unknown> }>(rawData);
-    if (!data?.id || !data?.updates) {
-      return createErrorResponse('Missing required fields: id, updates');
-    }
+    if (!data?.id || !data?.updates) return createErrorResponse('Missing required fields: id, updates');
     await credentialStore.update(String(data.id), data.updates as Partial<import('@/types/index').Credential>);
     const credential = await credentialStore.getById(String(data.id));
     if (!credential) return createErrorResponse('Credential not found after update');
     return createResponse({ credential });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to update credential: ${message}`);
+    return createErrorResponse(`Failed to update credential: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
@@ -170,32 +679,23 @@ registerHandler(MESSAGE_TYPES.DELETE_CREDENTIAL, async (rawData, _sender) => {
     await credentialStore.delete(String(data.id));
     return createResponse({ deleted: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to delete credential: ${message}`);
+    return createErrorResponse(`Failed to delete credential: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * ============================================================================
- * Login Handlers
- * ============================================================================
- */
+// ============================================================================
+// Login State Handlers
+// ============================================================================
 
-/**
- * START_LOGIN: Begin login process for an account
- */
 registerHandler(MESSAGE_TYPES.START_LOGIN, async (rawData, _sender) => {
   try {
     const data = d<{ accountId?: string; url?: string }>(rawData);
-    if (!data?.accountId || !data?.url) {
-      return createErrorResponse('Missing required fields: accountId, url');
-    }
+    if (!data?.accountId || !data?.url) return createErrorResponse('Missing required fields: accountId, url');
     const loginId = `login_${Date.now()}`;
     loginState.set(loginId, { accountId: data.accountId, startTime: Date.now(), status: 'IN_PROGRESS' });
     return createResponse<StartLoginResponse>({ loginId, status: 'IN_PROGRESS' as LoginStatus });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to start login: ${message}`);
+    return createErrorResponse(`Failed to start login: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
@@ -204,13 +704,12 @@ registerHandler(MESSAGE_TYPES.STOP_LOGIN, async (rawData, _sender) => {
     const data = d<{ accountId?: string }>(rawData);
     if (!data?.accountId) return createErrorResponse('Missing required field: accountId');
     let stopped = false;
-    for (const [loginId, state] of loginState.entries()) {
-      if (state.accountId === data.accountId) { loginState.delete(loginId); stopped = true; break; }
+    for (const [id, st] of loginState.entries()) {
+      if (st.accountId === data.accountId) { loginState.delete(id); stopped = true; break; }
     }
     return createResponse<StopLoginResponse>({ stopped });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to stop login: ${message}`);
+    return createErrorResponse(`Failed to stop login: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
@@ -220,1238 +719,277 @@ registerHandler(MESSAGE_TYPES.GET_STATUS, async (_data, _sender) => {
     const entry = loginState.entries().next().value as [string, LoginState] | undefined;
     const state = entry?.[1];
     return createResponse<GetStatusResponse>({
-      status: 'logging_in',
-      currentAccountId: state?.accountId,
-      errorMessage: state?.error
+      status: 'logging_in', currentAccountId: state?.accountId, errorMessage: state?.error
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createResponse<GetStatusResponse>({ status: 'error', errorMessage: message });
+    return createResponse<GetStatusResponse>({ status: 'error', errorMessage: error instanceof Error ? error.message : 'Unknown error' });
   }
 });
 
-/**
- * ============================================================================
- * Logging Handlers
- * ============================================================================
- */
+// ============================================================================
+// Logging Handlers
+// ============================================================================
 
-/**
- * LOG_ATTEMPT: Record a login attempt
- */
 registerHandler(MESSAGE_TYPES.LOG_ATTEMPT, async (rawData, _sender) => {
   try {
     const data = d<{ account_id?: string; status?: string; timestamp?: number; duration_ms?: number; error_message?: string; captcha_type?: string }>(rawData);
-    if (!data?.account_id || !data?.status || !data?.timestamp) {
-      return createErrorResponse('Missing required fields: account_id, status, timestamp');
-    }
+    if (!data?.account_id || !data?.status || !data?.timestamp) return createErrorResponse('Missing required fields');
     const logId = await logStore.add({
-      account_id: data.account_id,
-      status: data.status as LoginStatus,
-      timestamp: data.timestamp,
-      duration_ms: data.duration_ms,
-      error_message: data.error_message,
-      captcha_type: data.captcha_type
+      account_id: data.account_id, status: data.status as LoginStatus,
+      timestamp: data.timestamp, duration_ms: data.duration_ms,
+      error_message: data.error_message, captcha_type: data.captcha_type
     });
     return createResponse<LogAttemptResponse>({ logId });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to log attempt: ${message}`);
+    return createErrorResponse(`Failed to log attempt: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
 registerHandler(MESSAGE_TYPES.GET_LOGS, async (rawData, _sender) => {
   try {
     const data = d<{ accountId?: string; limit?: number }>(rawData);
-    const accountId = data?.accountId;
-    const limit = data?.limit ?? 100;
-
-    let logs;
-    if (accountId) {
-      logs = await logStore.getByAccountId(accountId, limit);
-    } else {
-      // Return recent logs across all accounts
-      logs = await logStore.filter(undefined, undefined, limit);
-    }
-
-    return createResponse<GetLogsResponse>({
-      logs
-    });
+    const logs = data?.accountId
+      ? await logStore.getByAccountId(data.accountId, data?.limit ?? 100)
+      : await logStore.filter(undefined, undefined, data?.limit ?? 100);
+    return createResponse<GetLogsResponse>({ logs });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to fetch logs: ${message}`);
+    return createErrorResponse(`Failed to fetch logs: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * EXPORT_LOGS: Export logs as CSV or JSON
- */
 registerHandler(MESSAGE_TYPES.EXPORT_LOGS, async (rawData, _sender) => {
   try {
     const data = d<{ accountId?: string; format?: string }>(rawData);
-    const accountId = data?.accountId;
-    const format = data?.format ?? 'csv';
-
     let exportData: string;
-    if (format === 'csv') {
-      exportData = await logStore.exportAsCSV(accountId);
+    if ((data?.format ?? 'csv') === 'csv') {
+      exportData = await logStore.exportAsCSV(data?.accountId);
     } else {
-      // JSON format
-      const logs = accountId
-        ? await logStore.getByAccountId(accountId, 1000)
+      const logs = data?.accountId
+        ? await logStore.getByAccountId(data.accountId, 1000)
         : await logStore.filter(undefined, undefined, 1000);
       exportData = JSON.stringify(logs, null, 2);
     }
-
-    return createResponse<ExportLogsResponse>({
-      data: exportData
-    });
+    return createResponse<ExportLogsResponse>({ data: exportData });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to export logs: ${message}`);
+    return createErrorResponse(`Failed to export logs: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * ============================================================================
- * Database Utility Handlers
- * ============================================================================
- */
+// ============================================================================
+// DB Utility Handlers
+// ============================================================================
 
-/**
- * GET_STATS: Get database statistics
- */
 registerHandler(MESSAGE_TYPES.GET_STATS, async (_data, _sender) => {
   try {
     const stats = await dbUtils.getStats();
-
     return createResponse<GetStatsResponse>({
-      credentials: stats.credentials,
-      cookies: stats.cookies,
-      logs: stats.logs,
-      screenshots: stats.screenshots,
-      screenshotSizeBytes: stats.screenshotSizeBytes
+      credentials: stats.credentials, cookies: stats.cookies,
+      logs: stats.logs, screenshots: stats.screenshots, screenshotSizeBytes: stats.screenshotSizeBytes
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to get stats: ${message}`);
+    return createErrorResponse(`Failed to get stats: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * CLEANUP_DB: Clean up old data based on retention policies
- */
 registerHandler(MESSAGE_TYPES.CLEANUP_DB, async (rawData, _sender) => {
   try {
-    const data = d<{ maxAgeDays?: number }>(rawData);
-    const maxAgeDays = data?.maxAgeDays ?? 30;
-    void maxAgeDays; // used for future cleanup logic
-
-    // Cleanup would be implemented with:
-    // - cookieStore.cleanupExpired(90)
-    // - logStore.cleanupOld(30)
-    // - screenshotStore.cleanupOld(30)
-    // For now, return placeholder
-
-    return createResponse<CleanupDbResponse>({
-      cleaned: {
-        cookies: 0,
-        logs: 0,
-        screenshots: 0
-      }
-    });
+    void d<{ maxAgeDays?: number }>(rawData);
+    return createResponse<CleanupDbResponse>({ cleaned: { cookies: 0, logs: 0, screenshots: 0 } });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Cleanup failed: ${message}`);
+    return createErrorResponse(`Cleanup failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * ============================================================================
- * Phase 4: Batch Login & Success File Saving
- * ============================================================================
- */
+// ============================================================================
+// Batch / Orchestration Handlers
+// ============================================================================
 
-/**
- * Helper: Wait for a tab to complete loading with stability check
- */
-function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    let stabilityTimeout: ReturnType<typeof setTimeout> | null = null;
-    const mainTimeout = setTimeout(() => {
-      cleanup();
-      resolve();
-    }, timeoutMs);
-
-    const cleanup = () => {
-      clearTimeout(mainTimeout);
-      if (stabilityTimeout) clearTimeout(stabilityTimeout);
-      chrome.tabs.onUpdated.removeListener(listener);
-    };
-
-    const listener = (updatedTabId: number, info: { status?: string }) => {
-      if (updatedTabId === tabId) {
-        // Clear previous stability check when tab updates
-        if (stabilityTimeout) clearTimeout(stabilityTimeout);
-
-        if (info.status === 'complete') {
-          // Wait for tab to be stable before resolving
-          stabilityTimeout = setTimeout(() => {
-            cleanup();
-            resolve();
-          }, 1000);
-        }
-      }
-    };
-
-    chrome.tabs.onUpdated.addListener(listener);
-  });
-}
-
-/**
- * Helper: Save success login to file and storage
- */
-type SaveableCookie = { name: string; value: string; domain: string; path: string; expirationDate?: number; expires?: number };
-
-async function saveSuccessToFile(
-  url: string,
-  username: string,
-  password: string,
-  cookies: SaveableCookie[],
-  timestamp: string | number | undefined
-): Promise<void> {
-  const hostname = new URL(url).hostname;
-  const ts = timestamp == null ? new Date().toISOString() : typeof timestamp === 'number' ? new Date(timestamp).toISOString() : timestamp;
-  const cookieLines = cookies
-    .map(c => {
-      const expiry = c.expirationDate ?? (c.expires ? c.expires / 1000 : undefined);
-      const expiresStr = expiry ? new Date(expiry * 1000).toISOString() : 'Session';
-      return (
-        `Name: ${c.name}\n` +
-        `Value: ${c.value}\n` +
-        `Domain: ${c.domain}\n` +
-        `Path: ${c.path}\n` +
-        `Expires: ${expiresStr}\n` +
-        `---`
-      );
-    })
-    .join('\n');
-
-  const content = [
-    '=== Login Success ===',
-    `URL: ${url}`,
-    `Username: ${username}`,
-    `Password: ${password}`,
-    `Timestamp: ${ts}`,
-    '',
-    '=== Cookies ===',
-    cookieLines
-  ].join('\n');
-
-  // Save to browser storage as backup
-  try {
-    const successLog = await new Promise<any>((res) => {
-      chrome.storage.local.get('successLog', res);
-    });
-    const log = successLog.successLog || [];
-    log.push({
-      hostname,
-      url,
-      username,
-      password,
-      timestamp: ts,
-      cookiesCount: cookies.length
-    });
-    // Keep only last 100 entries
-    if (log.length > 100) log.shift();
-
-    await new Promise<void>((res) => {
-      chrome.storage.local.set({ successLog: log }, () => res());
-    });
-    console.log(`AutoLogin: Success logged to storage for ${username}`);
-  } catch (storageError) {
-    console.error(`AutoLogin: Failed to save to storage:`, storageError);
-  }
-
-  // Try to download as file (may fail in Firefox but worth attempting)
-  try {
-    const blob = new Blob([content], { type: 'text/plain' });
-    const blobUrl = URL.createObjectURL(blob);
-
-    chrome.downloads.download(
-      {
-        url: blobUrl,
-        filename: `${hostname}-${username}-${Date.now()}.txt`,
-        saveAs: false,
-        conflictAction: 'overwrite'
-      },
-      (downloadId) => {
-        // Clean up blob URL after a delay
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-        console.log(`AutoLogin: File download initiated (ID: ${downloadId})`);
-      }
-    );
-  } catch (downloadError) {
-    console.warn(`AutoLogin: File download not available (expected in Firefox):`, downloadError);
-  }
-}
-
-/**
- * Helper: Capture a screenshot of a tab as base64 PNG
- */
-async function captureTabScreenshot(tabId: number): Promise<string | null> {
-  try {
-    // Firefox: captureTab works on any tab (active or not) with the `tabs` permission
-    const gBrowser = (globalThis as Record<string, unknown>)['browser'] as { tabs?: { captureTab?: (id: number, opts: object) => Promise<string> } } | undefined;
-    if (gBrowser?.tabs?.captureTab) {
-      return await gBrowser.tabs.captureTab(tabId, { format: 'png' });
-    }
-    // Chrome fallback: captureVisibleTab only works if tab is the active one
-    const tab = await chrome.tabs.get(tabId);
-    if (!tab.windowId) return null;
-    return await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-  } catch (error) {
-    console.error('AutoLogin: Failed to capture screenshot:', error);
-    return null;
-  }
-}
-
-/**
- * Helper: Use AI vision to analyze page screenshot and get form selectors
- */
-async function aiAnalyzePage(tabId: number, url: string): Promise<import('@automation/ai-agent').FormFieldsResult | null> {
-  const screenshot = await captureTabScreenshot(tabId);
-  if (!screenshot) {
-    console.log('AutoLogin AI: Could not capture screenshot for analysis');
-    return null;
-  }
-
-  console.log('AutoLogin AI: Screenshot captured, sending to Pollinations for analysis...');
-  const result = await analyzePageForLogin(screenshot, url);
-
-  if (!result.success) {
-    console.log('AutoLogin AI: Page analysis failed');
-    return null;
-  }
-
-  console.log(`AutoLogin AI: Page step detected: ${result.pageStep}, username: ${result.usernameSelector}, password: ${result.passwordSelector}, submit: ${result.submitSelector}`);
-  return result;
-}
-
-/**
- * Helper: Clear browser cookies for a URL
- */
-async function clearBrowserCookiesFor(url: string): Promise<void> {
-  const cookies = await new Promise<chrome.cookies.Cookie[]>((res) =>
-    chrome.cookies.getAll({ url }, res)
-  );
-
-  for (const cookie of cookies) {
-    const scheme = cookie.secure ? 'https' : 'http';
-    const domain = cookie.domain.startsWith('.') ? cookie.domain.slice(1) : cookie.domain;
-    const cookieUrl = `${scheme}://${domain}${cookie.path}`;
-    await new Promise<void>((res) =>
-      chrome.cookies.remove({ url: cookieUrl, name: cookie.name }, () => res())
-    );
-  }
-}
-
-/**
- * Helper: Pause batch login for user to solve CAPTCHA
- */
-async function pauseForCaptcha(
-  state: BatchState,
-  cred: BatchState['credentials'][0],
-  tabId: number,
-  captchaType: string
-): Promise<void> {
-  console.log(`⏸️ AutoLogin: PAUSING batch - CAPTCHA detected for ${cred.username}`);
-  console.log(`   CAPTCHA Type: ${captchaType}`);
-  console.log(`   Please solve the CAPTCHA in the tab and press 'Continue' in the popup`);
-
-  // Update batch state to PAUSED
-  await setBatchState({
-    ...state,
-    status: 'paused',
-    currentTabId: tabId
-  });
-
-  // Store captcha pause info for UI to display
-  await chrome.storage.local.set({
-    captchaPause: {
-      username: cred.username,
-      url: cred.url,
-      type: captchaType,
-      tabId: tabId,
-      timestamp: Date.now()
-    }
-  });
-
-  // Log the pause
-  await logStore.add({
-    account_id: cred.id,
-    status: 'CAPTCHA_PAUSED',
-    timestamp: Date.now(),
-    error_message: `${captchaType} - waiting for user to solve`
-  });
-
-  // Tab remains open - user solves CAPTCHA
-  // When user clicks "Continue" in popup, resumeBatchLogin will be called
-}
-
-/**
- * Helper: Resume batch login after CAPTCHA is solved
- */
-async function resumeBatchLogin(): Promise<void> {
-  const state = await getBatchState();
-  if (!state || state.status !== 'paused') {
-    console.log(`AutoLogin: No paused batch to resume`);
-    return;
-  }
-
-  console.log(`▶️ AutoLogin: Resuming batch login after CAPTCHA...`);
-  const cred = state.credentials[state.currentIndex];
-  const tabId = state.currentTabId;
-
-  if (!tabId) {
-    console.error(`AutoLogin: Tab ID missing, cannot resume`);
-    return;
-  }
-
-  // Wait a moment for page to settle after CAPTCHA solve
-  await new Promise(resolve => setTimeout(resolve, 2000));
-
-  // Resume: continue with multi-step flow after CAPTCHA solve (use longer timeout as page may still be settling)
-  let stepCount = 0;
-  const maxSteps = 2;
-
-  while (stepCount < maxSteps) {
-    stepCount++;
-    console.log(`AutoLogin: Form detection step ${stepCount} after CAPTCHA resume for ${cred.username}`);
-
-    const formResp = await sendToContent(tabId, {
-      type: MESSAGE_TYPES.DETECT_FORM,
-      data: { url: cred.url }
-    }, 10000);
-
-    if (!formResp.success || !formResp.data?.found) {
-      console.error(`AutoLogin: Could not find form at step ${stepCount} after CAPTCHA solve: ${formResp.error}`);
-      await finishCredential(state, cred, 'FORM_NOT_FOUND', tabId, `Step ${stepCount} after CAPTCHA: Form not found`);
-      return;
-    }
-
-    const formKind = formResp.data.kind || 'UNKNOWN';
-    console.log(`AutoLogin: Detected ${formKind} at step ${stepCount} after CAPTCHA`);
-
-    const fillResp = await sendToContent(tabId, {
-      type: MESSAGE_TYPES.FILL_FORM,
-      data: {
-        fields: formResp.data.fields ?? {},
-        username: cred.username,
-        password: cred.password
-      }
-    }, 10000);
-
-    if (!fillResp.success) {
-      console.error(`AutoLogin: Could not fill form at step ${stepCount} after CAPTCHA: ${fillResp.error}`);
-      await finishCredential(state, cred, 'FORM_FILL_FAILED', tabId, `Step ${stepCount} after CAPTCHA: ${fillResp.error}`);
-      return;
-    }
-
-    console.log(`AutoLogin: Submitting form at step ${stepCount} after CAPTCHA solve for ${cred.username}`);
-    const submitResp = await sendToContent(tabId, { type: MESSAGE_TYPES.SUBMIT_FORM, data: {} }, 10000);
-
-    if (!submitResp.success) {
-      console.error(`AutoLogin: Form submission failed at step ${stepCount} after CAPTCHA: ${submitResp.error}`);
-      await finishCredential(state, cred, 'FORM_SUBMIT_FAILED', tabId, `Step ${stepCount}: ${submitResp.error}`);
-      return;
-    }
-
-    // Wait for navigation
-    await waitForTabComplete(tabId, 20000);
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Break if full form or password step
-    if (formKind === 'FULL_FORM' || formKind === 'PASSWORD_STEP') {
-      console.log(`AutoLogin: Completed multi-step flow at step ${stepCount} after CAPTCHA`);
-      break;
-    }
-
-    // Continue if email step
-    if (formKind === 'EMAIL_STEP') {
-      console.log(`AutoLogin: Email step completed after CAPTCHA, looping to detect password step`);
-      continue;
-    }
-  }
-
-  // Check login status (use longer timeout for complex pages)
-  console.log(`AutoLogin: Checking login status after CAPTCHA solve for ${cred.username}`);
-  const statusResp = await sendToContent(tabId, {
-    type: MESSAGE_TYPES.CHECK_LOGIN_STATUS,
-    data: { originalUrl: cred.url }
-  }, 10000);
-
-  const loginStatus = statusResp.data?.status ?? 'WRONG_PASSWORD';
-
-  if (loginStatus === 'SUCCESS') {
-    console.log(`✅ AutoLogin: Login successful for ${cred.username} after CAPTCHA!`);
-
-    // Collect and save cookies
-    const liveCookies = await new Promise<chrome.cookies.Cookie[]>((res) =>
-      chrome.cookies.getAll({ url: cred.url }, res)
-    );
-
-    try {
-      await saveSuccessToFile(cred.url, cred.username, cred.password, liveCookies, new Date().toISOString());
-      console.log(`✅ AutoLogin: File saved for ${cred.username}`);
-    } catch (e) {
-      console.warn(`AutoLogin: File save failed:`, e);
-    }
-
-    const dbCookies: Cookie[] = liveCookies.map(c => ({
-      account_id: cred.id,
-      name: c.name,
-      value: c.value,
-      domain: c.domain,
-      path: c.path,
-      expires: c.expirationDate ? c.expirationDate * 1000 : undefined,
-      httpOnly: c.httpOnly,
-      secure: c.secure
-    }));
-
-    await cookieStore.saveCookies(cred.id, dbCookies);
-
-    // Attempt logout
-    try {
-      await sendToContent(tabId, { type: MESSAGE_TYPES.LOGOUT_PAGE, data: { url: cred.url } });
-      await waitForTabComplete(tabId, 5000);
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (e) {
-      console.error(`AutoLogin: Logout failed:`, e);
-    }
-
-    // Clear cookies
-    try {
-      await clearBrowserCookiesFor(cred.url);
-      await new Promise(resolve => setTimeout(resolve, 1500));
-    } catch (e) {
-      console.error(`AutoLogin: Cookie clear failed:`, e);
-    }
-
-    await logStore.add({
-      account_id: cred.id,
-      status: 'SUCCESS',
-      timestamp: Date.now(),
-      error_message: 'Solved via CAPTCHA pause'
-    });
-  } else {
-    console.log(`❌ AutoLogin: Login failed after CAPTCHA for ${cred.username}: ${loginStatus}`);
-    await logStore.add({
-      account_id: cred.id,
-      status: loginStatus as any,
-      timestamp: Date.now(),
-      error_message: statusResp.data?.errorText
-    });
-  }
-
-  // Advance and schedule next
-  const freshState = await getBatchState();
-  if (!freshState || freshState.status !== 'paused') return;
-
-  await setBatchState({
-    ...freshState,
-    status: 'running',
-    currentIndex: freshState.currentIndex + 1,
-    currentTabId: undefined
-  });
-
-  // Clear captcha pause info
-  await chrome.storage.local.remove('captchaPause');
-
-  // Close tab
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch {
-    // ignore
-  }
-
-  // Schedule next
-  const delayMs = Math.max(freshState.delayBetweenMs, 5000);
-  const delayMinutes = delayMs / 60000;
-  console.log(`AutoLogin: Scheduling next credential in ${delayMs}ms`);
-  chrome.alarms.create('batch_next_credential', { delayInMinutes: delayMinutes });
-}
-
-/**
- * Helper: Invoke AI agent to analyze login failure
- */
-async function invokeAIForFailure(
-  cred: BatchState['credentials'][0],
-  status: string,
-  errorMsg: string,
-  _tabId: number
-): Promise<void> {
-  try {
-    console.log(`AutoLogin: Invoking AI agent for failure analysis: ${cred.username} - ${status}`);
-
-    const context: LoginContext = {
-      credential: {
-        url: cred.url,
-        username: cred.username,
-        password: cred.password
-      },
-      status: status as any,
-      error: errorMsg,
-      pageUrl: cred.url,
-      attemptNumber: 1
-    };
-
-    const aiResponse = await analyzeLoginFailure(context);
-
-    logAIInteraction(cred.id, context, aiResponse);
-
-    if (aiResponse.success) {
-      console.log(`AutoLogin AI: Analysis for ${cred.username}:`, aiResponse.diagnosis);
-      console.log(`AutoLogin AI: Recommendations:`, aiResponse.recommendations);
-
-      // Store AI insights in session storage for UI to display
-      await chrome.storage.local.set({
-        [`ai_insight_${cred.id}`]: {
-          diagnosis: aiResponse.diagnosis,
-          recommendations: aiResponse.recommendations,
-          shouldRetry: aiResponse.shouldRetry,
-          urgency: aiResponse.urgency,
-          confidence: aiResponse.confidence,
-          timestamp: Date.now()
-        }
-      });
-    }
-  } catch (error) {
-    console.error('AutoLogin: Failed to invoke AI agent:', error);
-  }
-}
-
-/**
- * Helper: Finish current credential (log result, advance index, schedule next)
- */
-async function finishCredential(
-  _state: BatchState,
-  cred: BatchState['credentials'][0],
-  status: string,
-  tabId: number,
-  errorMsg: string
-): Promise<void> {
-  // Invoke AI agent for failure analysis (async, don't wait)
-  if (status !== 'SUCCESS') {
-    invokeAIForFailure(cred, status, errorMsg, tabId).catch(e =>
-      console.error('AutoLogin: AI analysis failed:', e)
-    );
-  }
-
-  await logStore.add({
-    account_id: cred.id,
-    status: status as any,
-    timestamp: Date.now(),
-    error_message: errorMsg
-  });
-
-  const freshState = await getBatchState();
-  if (!freshState || freshState.status !== 'running') return;
-
-  await setBatchState({
-    ...freshState,
-    currentIndex: freshState.currentIndex + 1,
-    currentTabId: undefined
-  });
-
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch {
-    // ignore
-  }
-
-  // Use at least 5 seconds delay between accounts for session cleanup
-  const delayMs = Math.max(freshState.delayBetweenMs, 5000);
-  const delayMinutes = delayMs / 60000;
-  console.log(`AutoLogin: Scheduling next credential in ${delayMs}ms`);
-  chrome.alarms.create('batch_next_credential', {
-    delayInMinutes: delayMinutes
-  });
-}
-
-/**
- * Process the next credential in the batch
- */
-async function processNextCredential(): Promise<void> {
-  const state = await getBatchState();
-  if (!state || state.status !== 'running') return;
-
-  if (state.currentIndex >= state.total) {
-    await setBatchState({ ...state, status: 'done', currentTabId: undefined });
-    return;
-  }
-
-  const cred = state.credentials[state.currentIndex];
-
-  // Close previous tab if any
-  if (state.currentTabId !== undefined) {
-    try {
-      await chrome.tabs.remove(state.currentTabId);
-    } catch {
-      // ignore
-    }
-  }
-
-  // Clear ALL cookies from the domain before opening new tab
-  console.log(`AutoLogin: Clearing cookies for ${cred.url} before next attempt`);
-  try {
-    await clearBrowserCookiesFor(cred.url);
-    // Add delay to ensure cookies are cleared
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  } catch (error) {
-    console.error(`AutoLogin: Failed to clear cookies:`, error);
-  }
-
-  // Open tab for this credential's URL
-  const tab = await new Promise<chrome.tabs.Tab>((res, rej) =>
-    chrome.tabs.create({ url: cred.url, active: false }, (t) => {
-      if (chrome.runtime.lastError) {
-        rej(new Error(chrome.runtime.lastError.message));
-      } else {
-        res(t);
-      }
-    })
-  );
-
-  const tabId = tab.id!;
-  await setBatchState({ ...state, currentTabId: tabId });
-
-  // Wait for page load (increased from 15s to 20s)
-  console.log(`AutoLogin: Waiting for page to load for ${cred.username}...`);
-  await waitForTabComplete(tabId, 20000);
-
-  // Additional delay to ensure page is ready
-  await new Promise(resolve => setTimeout(resolve, 1000));
-
-  // AI-vision multi-step form handling (email → next → password → submit)
-  let stepCount = 0;
-  const maxSteps = 6;
-  let captchaAttempts = 0;
-
-  while (stepCount < maxSteps) {
-    stepCount++;
-    console.log(`AutoLogin: AI analyzing page at step ${stepCount} for ${cred.username}`);
-
-    // Use AI vision to analyze current page screenshot
-    const currentTab = await chrome.tabs.get(tabId).catch(() => null);
-    const currentUrl = currentTab?.url || cred.url;
-    const aiResult = await aiAnalyzePage(tabId, currentUrl);
-
-    if (!aiResult) {
-      console.log(`AutoLogin: AI page analysis unavailable at step ${stepCount}, falling back to DOM detection`);
-      const formResp = await sendToContent(tabId, { type: MESSAGE_TYPES.DETECT_FORM, data: { url: cred.url } }, 10000);
-      if (!formResp.success || !formResp.data?.found) {
-        await finishCredential(state, cred, 'FORM_NOT_FOUND', tabId, `Step ${stepCount}: Neither AI nor DOM found form`);
-        return;
-      }
-
-      const detectedFields = formResp.data.fields ?? {};
-      console.log(`AutoLogin: DOM fallback filling form at step ${stepCount}`, detectedFields);
-      const fillResp = await sendToContent(tabId, {
-        type: MESSAGE_TYPES.FILL_FORM,
-        data: { fields: detectedFields, username: cred.username, password: cred.password }
-      }, 10000);
-      if (!fillResp.success) {
-        await finishCredential(state, cred, 'FORM_FILL_FAILED', tabId, `Step ${stepCount}: DOM fill failed: ${fillResp.error}`);
-        return;
-      }
-      console.log(`AutoLogin: DOM fallback filled ${fillResp.data?.fieldsFilled} fields at step ${stepCount}`);
-
-      await sendToContent(tabId, {
-        type: MESSAGE_TYPES.SUBMIT_FORM,
-        data: { selector: detectedFields.submit_selector }
-      }, 10000);
-
-      await waitForTabComplete(tabId, 20000);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      console.log(`AutoLogin: DOM fallback submitted form at step ${stepCount}, checking login status`);
-      break;
-    } else {
-      // Check if already on dashboard
-      if (aiResult.pageStep === 'dashboard') {
-        console.log(`✅ AutoLogin: AI detected dashboard - login successful for ${cred.username}`);
-        break;
-      }
-
-      // AI detected CAPTCHA — attempt to solve it
-      if (aiResult.captchaDetected || aiResult.pageStep === 'captcha') {
-        captchaAttempts++;
-        console.log(`AutoLogin AI: CAPTCHA detected at step ${stepCount} (attempt ${captchaAttempts}) — invoking AI CAPTCHA solver`);
-
-        // After 2 failed CAPTCHA attempts on same page, pause for human
-        if (captchaAttempts > 2) {
-          console.log(`⚠️ AutoLogin AI: CAPTCHA persists after ${captchaAttempts - 1} solve attempts — pausing for human`);
-          await pauseForCaptcha(state, cred, tabId, 'recaptcha_v2');
-          return;
-        }
-
-        const currentTab2 = await chrome.tabs.get(tabId).catch(() => null);
-        const captchaUrl = currentTab2?.url || cred.url;
-        const urlBeforeCaptcha = captchaUrl;
-        const captchaScreenshot = await captureTabScreenshot(tabId);
-
-        if (captchaScreenshot) {
-          const captchaSolution = await solveCaptcha(captchaScreenshot, captchaUrl);
-          console.log(`AutoLogin AI: CAPTCHA solution:`, captchaSolution);
-
-          // reCAPTCHA image challenge (tile grid) and hCaptcha cannot be reliably solved — pause immediately
-          if (captchaSolution.captchaType === 'image_grid' || captchaSolution.captchaType === 'hcaptcha') {
-            console.log(`⚠️ AutoLogin AI: Image grid CAPTCHA detected — pausing for human`);
-            await pauseForCaptcha(state, cred, tabId, captchaSolution.captchaType);
-            return;
-          }
-
-          if (captchaSolution.needsHuman || !captchaSolution.success || captchaSolution.captchaType === 'unknown') {
-            console.log(`⚠️ AutoLogin AI: CAPTCHA needs human intervention (type: ${captchaSolution.captchaType})`);
-            await pauseForCaptcha(state, cred, tabId, captchaSolution.captchaType || 'unknown');
-            return;
-          }
-
-          // Execute the AI solution in the content script
-          const execResp = await sendToContent(tabId, {
-            type: MESSAGE_TYPES.EXECUTE_CAPTCHA,
-            data: {
-              captchaType: captchaSolution.captchaType,
-              answer: captchaSolution.answer,
-              tileIndices: captchaSolution.tileIndices,
-              clickCheckbox: captchaSolution.clickCheckbox,
-              inputSelector: captchaSolution.inputSelector,
-              checkboxSelector: captchaSolution.checkboxSelector
-            }
-          }, 15000);
-
-          if (execResp.success && execResp.data?.solved) {
-            console.log(`✅ AutoLogin AI: CAPTCHA action done via ${execResp.data.method}`);
-            // Wait longer for CAPTCHA iframe to update
-            await new Promise(resolve => setTimeout(resolve, 4000));
-            await waitForTabComplete(tabId, 15000);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
-            // Check if URL changed — if still same page, CAPTCHA may have triggered image challenge
-            const tabAfter = await chrome.tabs.get(tabId).catch(() => null);
-            const urlAfter = tabAfter?.url || '';
-            if (urlAfter === urlBeforeCaptcha) {
-              console.log(`AutoLogin AI: URL unchanged after CAPTCHA click — taking new screenshot to reassess`);
-            }
-            continue; // Loop back to re-analyze the page
-          } else {
-            console.log(`⚠️ AutoLogin AI: CAPTCHA solve attempt failed (${execResp.data?.error}) — pausing for human`);
-            await pauseForCaptcha(state, cred, tabId, captchaSolution.captchaType);
-            return;
-          }
-        } else {
-          console.log(`⚠️ AutoLogin AI: Cannot screenshot for CAPTCHA solve — pausing for human`);
-          await pauseForCaptcha(state, cred, tabId, 'unknown');
-          return;
-        }
-      }
-
-      // Reset CAPTCHA counter when we move past the CAPTCHA step
-      captchaAttempts = 0;
-
-      // No form found by AI
-      if (!aiResult.usernameSelector && !aiResult.passwordSelector) {
-        console.log(`AutoLogin: AI found no form fields at step ${stepCount} (pageStep: ${aiResult.pageStep})`);
-        await finishCredential(state, cred, 'FORM_NOT_FOUND', tabId, `Step ${stepCount}: AI detected no login fields (${aiResult.pageStep})`);
-        return;
-      }
-
-      // Fill fields AI identified
-      const fields: { username_selector?: string; password_selector?: string; submit_selector?: string } = {};
-      if (aiResult.usernameSelector) fields.username_selector = aiResult.usernameSelector;
-      if (aiResult.passwordSelector) fields.password_selector = aiResult.passwordSelector;
-      if (aiResult.submitSelector) fields.submit_selector = aiResult.submitSelector;
-
-      console.log(`AutoLogin AI: Filling form step ${stepCount} - pageStep: ${aiResult.pageStep}, fields:`, fields);
-
-      const fillResp = await sendToContent(tabId, {
-        type: MESSAGE_TYPES.FILL_FORM,
-        data: { fields, username: cred.username, password: cred.password }
-      }, 10000);
-
-      if (!fillResp.success) {
-        console.log(`AutoLogin: Fill failed at step ${stepCount}: ${fillResp.error}`);
-        await finishCredential(state, cred, 'FORM_FILL_FAILED', tabId, `Step ${stepCount}: ${fillResp.error}`);
-        return;
-      }
-      console.log(`AutoLogin: Filled ${fillResp.data?.fieldsFilled} fields at step ${stepCount}`);
-
-      // Click the submit/next button AI identified
-      const submitSelector = aiResult.submitSelector;
-      console.log(`AutoLogin AI: Clicking submit button: "${submitSelector}" at step ${stepCount}`);
-      const submitResp = await sendToContent(tabId, {
-        type: MESSAGE_TYPES.SUBMIT_FORM,
-        data: { selector: submitSelector }
-      }, 10000);
-
-      if (!submitResp.success) {
-        console.log(`AutoLogin: Submit failed at step ${stepCount}: ${submitResp.error}`);
-        await finishCredential(state, cred, 'FORM_SUBMIT_FAILED', tabId, `Step ${stepCount}: ${submitResp.error}`);
-        return;
-      }
-
-      console.log(`AutoLogin: Submitted form at step ${stepCount}`);
-
-      // Wait for navigation after submit
-      await waitForTabComplete(tabId, 20000);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // If password step done, we're done
-      if (aiResult.pageStep === 'password' || aiResult.pageStep === 'full') {
-        console.log(`AutoLogin: Password step completed at step ${stepCount}, checking login status`);
-        break;
-      }
-
-      // Email step done — loop for password step
-      if (aiResult.pageStep === 'email') {
-        console.log(`AutoLogin: Email step done at step ${stepCount}, looping for password step`);
-        continue;
-      }
-    }
-  }
-
-  // Check login status (use longer timeout)
-  console.log(`AutoLogin: Checking login status for ${cred.username}`);
-  const statusResp = await sendToContent(tabId, {
-    type: MESSAGE_TYPES.CHECK_LOGIN_STATUS,
-    data: { originalUrl: cred.url }
-  }, 10000);
-
-  const loginStatus = statusResp.data?.status ?? 'WRONG_PASSWORD';
-
-  if (loginStatus === 'SUCCESS') {
-    console.log(`✅ AutoLogin: Login successful for ${cred.username}!`);
-
-    // Collect live cookies WHILE STILL LOGGED IN
-    console.log(`AutoLogin: Collecting cookies for ${cred.username}`);
-    const liveCookies = await new Promise<chrome.cookies.Cookie[]>((res) =>
-      chrome.cookies.getAll({ url: cred.url }, res)
-    );
-    console.log(`AutoLogin: Collected ${liveCookies.length} cookies`);
-
-    // Save to file IMMEDIATELY after collecting
-    console.log(`AutoLogin: Saving credentials and cookies to file for ${cred.username}`);
-    try {
-      await saveSuccessToFile(cred.url, cred.username, cred.password, liveCookies, new Date().toISOString());
-      console.log(`✅ AutoLogin: File saved successfully for ${cred.username}`);
-    } catch (fileError) {
-      console.error(`❌ AutoLogin: Failed to save file:`, fileError);
-    }
-
-    // Save cookies to DB IMMEDIATELY
-    console.log(`AutoLogin: Saving ${liveCookies.length} cookies to database`);
-    const dbCookies: Cookie[] = liveCookies.map(c => ({
-      account_id: cred.id,
-      name: c.name,
-      value: c.value,
-      domain: c.domain,
-      path: c.path,
-      expires: c.expirationDate ? c.expirationDate * 1000 : undefined,
-      httpOnly: c.httpOnly,
-      secure: c.secure
-    }));
-
-    try {
-      await cookieStore.saveCookies(cred.id, dbCookies);
-      console.log(`✅ AutoLogin: Cookies saved to DB for ${cred.username}`);
-    } catch (dbError) {
-      console.error(`❌ AutoLogin: Failed to save cookies to DB:`, dbError);
-    }
-
-    // THEN attempt logout (non-fatal)
-    console.log(`AutoLogin: Attempting logout for ${cred.username}`);
-    try {
-      await sendToContent(tabId, {
-        type: MESSAGE_TYPES.LOGOUT_PAGE,
-        data: { url: cred.url }
-      });
-      await waitForTabComplete(tabId, 5000);
-      // Add delay after logout
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      console.log(`✅ AutoLogin: Logout completed for ${cred.username}`);
-    } catch (error) {
-      console.error(`AutoLogin: Logout attempt failed:`, error);
-    }
-
-    // Clear browser cookies AFTER logout
-    console.log(`AutoLogin: Clearing all cookies for ${cred.url}`);
-    try {
-      await clearBrowserCookiesFor(cred.url);
-      // Give time for cookie deletion to sync
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      console.log(`✅ AutoLogin: Cookies cleared for ${cred.url}`);
-    } catch (error) {
-      console.error(`AutoLogin: Cookie clearing failed:`, error);
-    }
-
-    // Log success
-    await logStore.add({
-      account_id: cred.id,
-      status: 'SUCCESS',
-      timestamp: Date.now()
-    });
-    console.log(`✅ AutoLogin: Success logged for ${cred.username}`);
-  } else {
-    // Handle different failure types
-    if (loginStatus === 'CAPTCHA_TIMEOUT') {
-      console.log(`⚠️ AutoLogin: CAPTCHA appeared after submission for ${cred.username}`);
-    } else if (loginStatus === 'WRONG_PASSWORD') {
-      console.log(`❌ AutoLogin: Wrong password for ${cred.username}: ${statusResp.data?.errorText}`);
-    } else if (loginStatus === 'IN_PROGRESS') {
-      console.log(`⏳ AutoLogin: Login still in progress for ${cred.username} (may have failed)`);
-    }
-
-    // Log failure
-    await logStore.add({
-      account_id: cred.id,
-      status: loginStatus as any,
-      timestamp: Date.now(),
-      error_message: statusResp.data?.errorText
-    });
-  }
-
-  // Advance to next
-  const freshState = await getBatchState();
-  if (!freshState || freshState.status !== 'running') return;
-
-  await setBatchState({
-    ...freshState,
-    currentIndex: freshState.currentIndex + 1,
-    currentTabId: undefined
-  });
-
-  // Close current tab
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch {
-    // ignore
-  }
-
-  // Schedule next
-  chrome.alarms.create('batch_next_credential', {
-    delayInMinutes: Math.max(freshState.delayBetweenMs, 1000) / 60000
-  });
-}
-
-/**
- * SAVE_SUCCESS_FILE: Save login credentials and cookies to file
- */
-registerHandler(MESSAGE_TYPES.SAVE_SUCCESS_FILE, async (rawData, _sender) => {
-  try {
-    const data = d<{ url: string; username: string; password: string; cookies?: Cookie[]; timestamp?: number }>(rawData);
-    const { url, username, password, cookies, timestamp } = data;
-    await saveSuccessToFile(url, username, password, cookies ?? [], timestamp);
-
-    const hostname = new URL(url).hostname;
-    return createResponse<SaveSuccessFileResponse>({
-      saved: true,
-      filename: `logscomplete\\${hostname}-correct.txt`
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to save file: ${message}`);
-  }
-});
-
-/**
- * CLEAR_BROWSER_COOKIES: Remove all cookies for a domain
- */
-registerHandler(MESSAGE_TYPES.CLEAR_BROWSER_COOKIES, async (rawData, _sender) => {
-  try {
-    const data = d<{ url: string }>(rawData);
-    const { url } = data;
-    const allCookies = await new Promise<chrome.cookies.Cookie[]>((res, rej) =>
-      chrome.cookies.getAll({ url }, (cookies) => {
-        if (chrome.runtime.lastError) {
-          rej(new Error(chrome.runtime.lastError.message));
-        } else {
-          res(cookies);
-        }
-      })
-    );
-
-    let cleared = 0;
-    for (const cookie of allCookies) {
-      const scheme = cookie.secure ? 'https' : 'http';
-      const domain = cookie.domain.startsWith('.') ? cookie.domain.slice(1) : cookie.domain;
-      const cookieUrl = `${scheme}://${domain}${cookie.path}`;
-      await new Promise<void>((res) =>
-        chrome.cookies.remove({ url: cookieUrl, name: cookie.name }, () => res())
-      );
-      cleared++;
-    }
-
-    return createResponse<ClearBrowserCookiesResponse>({ cleared });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to clear cookies: ${message}`);
-  }
-});
-
-/**
- * START_BATCH_LOGIN: Begin batch processing of all credentials
- */
 registerHandler(MESSAGE_TYPES.START_BATCH_LOGIN, async (rawData, _sender) => {
   try {
     const data = d<{ delayBetweenMs?: number }>(rawData);
     const credentials = await credentialStore.getAll();
-    if (credentials.length === 0) {
-      return createErrorResponse('No credentials to process');
-    }
+    if (credentials.length === 0) return createErrorResponse('No credentials to process');
 
-    const credList = credentials.map(c => ({
-      id: c.id!,
-      url: c.url,
-      username: c.username,
-      password: c.password!
-    }));
+    const rawCreds = credentials.map(c => ({ id: c.id!, url: c.url, username: c.username, password: c.password! }));
+    const accounts = groupAndSort(rawCreds);
 
-    const state: BatchState = {
-      credentials: credList,
-      currentIndex: 0,
-      total: credList.length,
+    const state: OrchestratorState = {
       status: 'running',
+      accounts,
+      currentIndex: 0,
+      total: accounts.length,
+      startedAt: Date.now(),
       delayBetweenMs: data?.delayBetweenMs ?? 3000,
-      startedAt: Date.now()
+      templates: {},
+      hostnameFailures: {},
+      currentSteps: []
     };
 
-    await setBatchState(state);
-    await processNextCredential();
+    await setOrchestratorState(state);
+    await chrome.storage.local.set({ ai_feed: [] });  // clear feed on new batch
+    await startNextAccount();
 
     return createResponse<StartBatchLoginResponse>({ started: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to start batch: ${message}`);
+    return createErrorResponse(`Failed to start batch: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * STOP_BATCH_LOGIN: Stop batch processing
- */
 registerHandler(MESSAGE_TYPES.STOP_BATCH_LOGIN, async (_data, _sender) => {
   try {
-    chrome.alarms.clear('batch_next_credential');
-    const state = await getBatchState();
+    chrome.alarms.clear('batch_tick');
+    const state = await getOrchestratorState();
     if (state) {
-      if (state.currentTabId) {
-        try {
-          await chrome.tabs.remove(state.currentTabId);
-        } catch {
-          // ignore
-        }
-      }
-      await setBatchState({ ...state, status: 'stopped' });
+      if (state.currentTabId !== undefined) await chrome.tabs.remove(state.currentTabId).catch(() => {});
+      await setOrchestratorState({ ...state, status: 'stopped' });
     }
     return createResponse({ stopped: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to stop batch: ${message}`);
+    return createErrorResponse(`Failed to stop batch: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * RESUME_BATCH_LOGIN: Resume after CAPTCHA is solved
- * Returns immediately - actual resumption happens asynchronously in background
- */
 registerHandler(MESSAGE_TYPES.RESUME_BATCH_LOGIN, async (_data, _sender) => {
   try {
-    const state = await getBatchState();
-    if (!state || state.status !== 'paused') {
-      return createErrorResponse('No paused batch to resume');
-    }
+    const state = await getOrchestratorState();
+    if (!state || state.status !== 'captcha_pause') return createErrorResponse('No paused batch to resume');
 
-    // Check if already resuming (prevent double-clicks)
-    const resumingKey = `batch_resuming_${state.currentIndex}`;
-    const resuming = await chrome.storage.local.get(resumingKey);
-    if (resuming[resumingKey]) {
-      return createErrorResponse('Resume already in progress');
-    }
-
-    // Mark as resuming to prevent double-clicks
-    await chrome.storage.local.set({ [resumingKey]: true });
-
-    // Start resumption in background (don't wait for it)
-    resumeBatchLogin().finally(() => {
-      chrome.storage.local.remove(resumingKey);
+    await setOrchestratorState({
+      ...state,
+      status: 'running',
+      currentIndex: state.currentIndex + 1,
+      currentTabId: undefined,
+      currentSteps: []
     });
+    await chrome.storage.local.remove('captchaPause');
+    chrome.alarms.create('batch_tick', { delayInMinutes: 0.05 });
 
     return createResponse<ResumeBatchLoginResponse>({ resumed: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to resume batch: ${message}`);
+    return createErrorResponse(`Failed to resume batch: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * GET_BATCH_STATUS: Get current batch progress
- */
+registerHandler(MESSAGE_TYPES.USER_INSTRUCTION, async (rawData, _sender) => {
+  try {
+    const data = d<{ instruction?: string }>(rawData);
+    if (!data?.instruction?.trim()) return createErrorResponse('Missing instruction');
+
+    const state = await getOrchestratorState();
+    if (!state || state.status !== 'waiting_instruction') return createErrorResponse('Not waiting for instruction');
+
+    const escalatedHostname = state.escalation?.hostname ?? '';
+
+    await appendToAiFeed({
+      accountId: 'user', username: 'You', hostname: escalatedHostname,
+      commentary: `"${data.instruction}" — Resuming...`,
+      action: 'user_instruction', timestamp: Date.now()
+    });
+
+    await setOrchestratorState({
+      ...state,
+      status: 'running',
+      pendingInstruction: data.instruction,
+      escalation: undefined,
+      // Reset failure count for escalated hostname so it gets 3 more attempts
+      hostnameFailures: { ...state.hostnameFailures, [escalatedHostname]: 0 }
+    });
+
+    chrome.alarms.create('batch_tick', { delayInMinutes: 0.05 });
+    return createResponse({ resumed: true });
+  } catch (error) {
+    return createErrorResponse(`Failed to process instruction: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+});
+
 registerHandler(MESSAGE_TYPES.GET_BATCH_STATUS, async (_data, _sender) => {
   try {
-    const state = await getBatchState();
-    if (!state) {
-      return createResponse<BatchProgress>({
-        total: 0,
-        completed: 0,
-        status: 'idle'
-      });
-    }
+    const state = await getOrchestratorState();
+    if (!state) return createResponse<BatchProgress>({ total: 0, completed: 0, status: 'idle' });
 
-    const current =
-      state.currentIndex < state.total
-        ? `${state.credentials[state.currentIndex].username} @ ${new URL(state.credentials[state.currentIndex].url).hostname}`
-        : undefined;
+    const current = state.currentIndex < state.total
+      ? `${state.accounts[state.currentIndex].username} @ ${state.accounts[state.currentIndex].hostname}`
+      : undefined;
+
+    const feedResult = await chrome.storage.local.get('ai_feed');
+    const feed = (feedResult['ai_feed'] as AiFeedEntry[]) ?? [];
+    const latest = feed[feed.length - 1];
 
     return createResponse<BatchProgress>({
       total: state.total,
       completed: state.currentIndex,
       current,
-      currentUrl: state.currentIndex < state.total ? state.credentials[state.currentIndex].url : undefined,
-      status: state.status
+      currentUrl: state.currentIndex < state.total ? state.accounts[state.currentIndex].url : undefined,
+      status: state.status,
+      aiCommentary: latest?.commentary,
+      escalationReason: state.escalation?.reason,
+      escalationHostname: state.escalation?.hostname
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to get batch status: ${message}`);
+    return createErrorResponse(`Failed to get batch status: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * DEV_GET_LOGS: Developer mode - get recent logs
- */
+// ============================================================================
+// File / Cookie Handlers
+// ============================================================================
+
+registerHandler(MESSAGE_TYPES.SAVE_SUCCESS_FILE, async (rawData, _sender) => {
+  try {
+    const data = d<{ url: string; username: string; password: string; cookies?: Cookie[]; timestamp?: number }>(rawData);
+    await saveSuccessToFile(data.url, data.username, data.password, data.cookies ?? [], data.timestamp);
+    return createResponse<SaveSuccessFileResponse>({
+      saved: true, filename: `logscomplete\\${new URL(data.url).hostname}-correct.txt`
+    });
+  } catch (error) {
+    return createErrorResponse(`Failed to save file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+});
+
+registerHandler(MESSAGE_TYPES.CLEAR_BROWSER_COOKIES, async (rawData, _sender) => {
+  try {
+    const data = d<{ url: string }>(rawData);
+    const allCookies = await new Promise<chrome.cookies.Cookie[]>((res, rej) =>
+      chrome.cookies.getAll({ url: data.url }, cookies => {
+        if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
+        else res(cookies);
+      })
+    );
+    let cleared = 0;
+    for (const c of allCookies) {
+      const scheme = c.secure ? 'https' : 'http';
+      const domain = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+      await new Promise<void>(res => chrome.cookies.remove({ url: `${scheme}://${domain}${c.path}`, name: c.name }, () => res()));
+      cleared++;
+    }
+    return createResponse<ClearBrowserCookiesResponse>({ cleared });
+  } catch (error) {
+    return createErrorResponse(`Failed to clear cookies: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+});
+
+// ============================================================================
+// Developer Handlers
+// ============================================================================
+
 registerHandler(MESSAGE_TYPES.DEV_GET_LOGS, async (rawData, _sender) => {
   try {
     const data = d<{ limit?: number }>(rawData);
-    const limit = data?.limit ?? 50;
-    const logs = await logStore.filter(undefined, undefined, limit);
+    const logs = await logStore.filter(undefined, undefined, data?.limit ?? 50);
     return createResponse<DevGetLogsResponse>({ logs });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to get logs: ${message}`);
+    return createErrorResponse(`Failed to get logs: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 
-/**
- * DEV_CLEAR_DATA: Developer mode - clear all extension data
- */
 registerHandler(MESSAGE_TYPES.DEV_CLEAR_DATA, async (_data, _sender) => {
   try {
-    await dbUtils.clearAll().catch(() => {
-      // if clearAll doesn't exist, clear individually
-    });
-    await setBatchState(null);
+    await dbUtils.clearAll().catch(() => {});
+    await setOrchestratorState(null);
+    await chrome.storage.local.remove(['ai_feed', 'captchaPause']);
     return createResponse({ cleared: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    return createErrorResponse(`Failed to clear data: ${message}`);
+    return createErrorResponse(`Failed to clear data: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 

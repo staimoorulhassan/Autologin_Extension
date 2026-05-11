@@ -10,22 +10,43 @@ const AI_CONFIG = {
   // Primary: Pollinations — OpenAI-compatible, requires API key
   pollinations: {
     baseUrl: 'https://gen.pollinations.ai/v1',
-    visionModel: 'openai',       // GPT-4o based, supports image input
+    visionModel: 'openai',
     textModel: 'openai',
   },
   // Fallback: OpenRouter free tier — requires API key in extension options
   openrouter: {
     baseUrl: 'https://openrouter.ai/api/v1',
     visionModels: [
-      'baidu/qianfan-ocr-fast:free',
-      'google/gemma-4-31b-it:free',
-      'google/gemma-4-26b-a4b-it:free',
-      'nvidia/nemotron-nano-12b-v2-vl:free',
+      'qwen/qwen2.5-vl-72b-instruct:free',       // best free vision model
+      'meta-llama/llama-3.2-90b-vision-instruct:free',
+      'google/gemini-2.0-flash-exp:free',
+      'google/gemma-3-27b-it:free',
     ],
-    textModel: 'baidu/qianfan-ocr-fast:free',
+    textModel: 'meta-llama/llama-3.3-70b-instruct:free',
   },
   timeout: 45000
 };
+
+interface StoredSiteHint { hostname: string; hint: string; savedAt: number; }
+
+/** Return user-saved hints matching the given URL's hostname. */
+export async function getSiteHintsForUrl(url: string): Promise<string[]> {
+  try {
+    const hostname = new URL(url).hostname;
+    return new Promise(resolve =>
+      chrome.storage.local.get('site_hints', r => {
+        const all = (r['site_hints'] as StoredSiteHint[]) || [];
+        resolve(
+          all
+            .filter(h => hostname.includes(h.hostname) || h.hostname.includes(hostname))
+            .map(h => h.hint)
+        );
+      })
+    );
+  } catch {
+    return [];
+  }
+}
 
 /** Load API keys from storage. */
 async function getApiKeys(): Promise<{ pollinations: string; openrouter: string }> {
@@ -70,6 +91,7 @@ export interface AIAgentResponse {
  */
 export interface FormFieldsResult {
   success: boolean;
+  error?: string;
   usernameSelector?: string;
   passwordSelector?: string;
   submitSelector?: string;
@@ -80,9 +102,14 @@ export interface FormFieldsResult {
 
 export async function analyzePageForLogin(screenshotBase64: string, pageUrl: string): Promise<FormFieldsResult> {
   try {
+    const siteHints = await getSiteHintsForUrl(pageUrl);
+    const hintsSection = siteHints.length > 0
+      ? `\n\nUser-provided site instructions (follow these carefully):\n${siteHints.map((h, i) => `${i + 1}. ${h}`).join('\n')}`
+      : '';
+
     const prompt = `You are analyzing a browser screenshot of a login page. Look at the page carefully.
 
-Page URL: ${pageUrl}
+Page URL: ${pageUrl}${hintsSection}
 
 Tasks:
 1. Identify what step this login page is showing: "email" (only email/username input visible), "password" (only password input visible), "full" (both email and password visible), "captcha" (CAPTCHA challenge visible), "dashboard" (user is already logged in - no login form), or "unknown".
@@ -103,7 +130,8 @@ Respond ONLY with this JSON (no extra text):
     const response = await callAIWithVision(prompt, screenshotBase64);
 
     if (!response.success || !response.content) {
-      return { success: false };
+      console.warn('AutoLogin AI: Vision call failed:', response.error);
+      return { success: false, error: response.error };
     }
 
     const parsed = parseJSON(response.content);
@@ -118,13 +146,20 @@ Respond ONLY with this JSON (no extra text):
     const rawStep = parsed.pageStep as string;
     const pageStep: PageStep = validSteps.includes(rawStep as PageStep) ? rawStep as PageStep : 'unknown';
 
+    // Strip AI-returned string literals "null"/"undefined" so callers can rely on truthiness
+    const cleanSel = (v: unknown): string | undefined => {
+      if (typeof v !== 'string') return undefined;
+      const s = v.trim();
+      return (s === 'null' || s === 'undefined' || s === 'none' || s === '') ? undefined : s;
+    };
+
     return {
       success: true,
-      usernameSelector: typeof parsed.usernameSelector === 'string' ? parsed.usernameSelector : undefined,
-      passwordSelector: typeof parsed.passwordSelector === 'string' ? parsed.passwordSelector : undefined,
-      submitSelector: typeof parsed.submitSelector === 'string' ? parsed.submitSelector : undefined,
+      usernameSelector: cleanSel(parsed.usernameSelector),
+      passwordSelector: cleanSel(parsed.passwordSelector),
+      submitSelector: cleanSel(parsed.submitSelector),
       captchaDetected: !!parsed.captchaDetected,
-      captchaText: typeof parsed.captchaText === 'string' ? parsed.captchaText : undefined,
+      captchaText: typeof parsed.captchaText === 'string' && parsed.captchaText !== 'null' ? parsed.captchaText : undefined,
       pageStep
     };
   } catch (error) {
@@ -283,6 +318,7 @@ async function tryVisionEndpoint(
     headers['X-Title'] = 'AutoLogin Extension';
   }
 
+  console.log(`AutoLogin AI: Calling ${baseUrl}/chat/completions with model=${model}`);
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers,
@@ -302,13 +338,16 @@ async function tryVisionEndpoint(
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({})) as { error?: { message?: string } };
-    const msg = err?.error?.message || response.statusText;
+    const errText = await response.text().catch(() => '');
+    console.error(`AutoLogin AI: ${model} HTTP ${response.status} from ${baseUrl}:`, errText);
+    let msg = response.statusText;
+    try { msg = (JSON.parse(errText) as { error?: { message?: string } })?.error?.message || msg; } catch { /* ignore */ }
     return { success: false, error: `${model}: ${response.status} ${msg}` };
   }
 
   const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
   const content = data.choices?.[0]?.message?.content || '';
+  if (!content) console.warn(`AutoLogin AI: ${model} returned empty content, full response:`, data);
   return content ? { success: true, content } : { success: false, error: `${model}: empty response` };
 }
 
@@ -323,30 +362,34 @@ async function callAIWithVision(
   const errors: string[] = [];
   const keys = await getApiKeys();
 
-  // 1. Try Pollinations (primary)
-  if (keys.pollinations) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
-      const result = await tryVisionEndpoint(
-        AI_CONFIG.pollinations.baseUrl,
-        AI_CONFIG.pollinations.visionModel,
-        prompt, base64Data, controller.signal, keys.pollinations
-      );
-      clearTimeout(timeoutId);
-      if (result.success) {
-        console.log('AutoLogin AI: Used Pollinations (primary)');
-        return result;
-      }
-      errors.push(`pollinations: ${result.error}`);
-      console.warn('AutoLogin AI: Pollinations failed, trying OpenRouter...', result.error);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      errors.push(`pollinations: ${msg}`);
-      console.warn('AutoLogin AI: Pollinations threw:', msg);
+  // 1. Try Pollinations (primary — free tier, no API key required)
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), AI_CONFIG.timeout);
+    const result = await tryVisionEndpoint(
+      AI_CONFIG.pollinations.baseUrl,
+      AI_CONFIG.pollinations.visionModel,
+      prompt, base64Data, controller.signal,
+      keys.pollinations  // passes key if configured, empty string otherwise (no auth header)
+    );
+    clearTimeout(timeoutId);
+    if (result.success) {
+      console.log('AutoLogin AI: Used Pollinations (primary)');
+      return result;
     }
-  } else {
-    errors.push('pollinations: no API key set');
+    errors.push(`pollinations: ${result.error}`);
+    console.warn('AutoLogin AI: Pollinations failed, trying OpenRouter...', result.error);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`pollinations: ${msg}`);
+    console.warn('AutoLogin AI: Pollinations threw:', msg);
+  }
+
+  // If Pollinations threw a network error, the device is offline or the endpoint is down —
+  // skip all OpenRouter attempts immediately instead of wasting 3+ minutes on timeouts
+  if (errors.some(e => e.includes('Failed to fetch') || e.includes('NetworkError') || e.includes('network'))) {
+    console.warn('AutoLogin AI: Network unavailable — skipping OpenRouter fallbacks');
+    return { success: false, error: `Network unavailable: ${errors[0]}` };
   }
 
   // 2. Fall back to OpenRouter
@@ -534,4 +577,133 @@ function fallbackResponse(reason: string): AIAgentResponse {
   };
 }
 
-export default { analyzePageForLogin, analyzeLoginFailure, logAIInteraction, AI_CONFIG };
+// ============================================================================
+// Per-action AI Orchestration (new architecture)
+// ============================================================================
+
+export interface LoginTemplate {
+  actions: Array<{ action: 'type' | 'click'; selector: string; fieldType: string }>;
+  savedAt: number;
+}
+
+export interface ActionContext {
+  username: string;
+  stepHistory: Array<{ action: string; selector?: string; commentary: string; result: string; fieldType?: string }>;
+  hints: string[];
+  template?: LoginTemplate;
+  instruction?: string;
+}
+
+export interface ActionDecision {
+  action: 'type' | 'click' | 'wait' | 'report_success' | 'report_failure' | 'report_captcha';
+  selector?: string;
+  value?: string;
+  fieldType?: 'username' | 'password' | 'submit' | 'nav' | 'other';
+  waitMs?: number;
+  commentary: string;
+  confidence: number;
+}
+
+/**
+ * Decide the single next browser action to progress a login.
+ * Called once per AI orchestration step — returns one action at a time.
+ */
+export async function decideNextAction(
+  screenshotBase64: string,
+  pageUrl: string,
+  context: ActionContext
+): Promise<ActionDecision | null> {
+  const historyText = context.stepHistory.length > 0
+    ? context.stepHistory.slice(-5).map((s, i) =>
+        `${i + 1}. ${s.action}${s.selector ? ` [${s.selector}]` : ''} → ${s.result}: ${s.commentary}`
+      ).join('\n')
+    : '(no previous actions)';
+
+  const templateText = context.template && context.template.actions.length > 0
+    ? `\nWorking template from previous successful login on this site:\n${context.template.actions.map(a => `- ${a.action} [${a.selector}] (${a.fieldType})`).join('\n')}`
+    : '';
+
+  const hintsText = context.hints.length > 0
+    ? `\nUser instructions for this site:\n${context.hints.map((h, i) => `${i + 1}. ${h}`).join('\n')}`
+    : '';
+
+  const instructionText = context.instruction
+    ? `\nSpecial user instruction (follow this): ${context.instruction}`
+    : '';
+
+  const prompt = `You are a browser automation agent logging into a website as user "${context.username}".
+
+Page URL: ${pageUrl}
+
+Previous actions taken (last 5):
+${historyText}${templateText}${hintsText}${instructionText}
+
+Look at the screenshot and decide the SINGLE NEXT ACTION to progress the login.
+
+Respond ONLY with this JSON (no extra text):
+{
+  "action": "type" | "click" | "wait" | "report_success" | "report_failure" | "report_captcha",
+  "selector": "CSS selector (required for type/click, prefer #id over class)",
+  "value": "text to type (required for type action only)",
+  "fieldType": "username" | "password" | "submit" | "nav" | "other",
+  "waitMs": 2000,
+  "commentary": "One sentence: what you see and what you are doing",
+  "confidence": 0.9
+}
+
+Action rules:
+- "type": fill an input field (provide selector + value)
+- "click": click a button/link/element (provide selector)
+- "wait": pause while page loads (provide waitMs)
+- "report_success": user is now logged in — dashboard/feed/home visible, no login form
+- "report_failure": login clearly failed (wrong password error, account locked)
+- "report_captcha": CAPTCHA requires human solving
+
+CRITICAL rules — read these carefully:
+- If you see a validation error like "Password can't be blank" or "field is required", the field was NOT filled correctly. You MUST type into that field again before clicking submit — never click submit when a required field shows a blank/empty error.
+- If a password field looks empty or shows its placeholder text, type the password into it even if your history says you already typed it. Always trust what you SEE in the screenshot over your history.
+- Never click the submit button if any required field appears empty or shows a validation error.`;
+
+  try {
+    const response = await callAIWithVision(prompt, screenshotBase64);
+
+    if (!response.success || !response.content) {
+      console.warn('AutoLogin AI: decideNextAction failed:', response.error);
+      return null;
+    }
+
+    const parsed = parseJSON(response.content);
+    if (!parsed) return null;
+
+    const validActions = ['type', 'click', 'wait', 'report_success', 'report_failure', 'report_captcha'] as const;
+    type ActionType = typeof validActions[number];
+    const action = validActions.includes(parsed.action as ActionType) ? parsed.action as ActionType : null;
+    if (!action) return null;
+
+    const validFieldTypes = ['username', 'password', 'submit', 'nav', 'other'] as const;
+    type FieldType = typeof validFieldTypes[number];
+    const rawFT = parsed.fieldType as string;
+    const fieldType: FieldType = validFieldTypes.includes(rawFT as FieldType) ? rawFT as FieldType : 'other';
+
+    const cleanSel = (v: unknown): string | undefined => {
+      if (typeof v !== 'string') return undefined;
+      const s = v.trim();
+      return (s === 'null' || s === 'undefined' || s === 'none' || s === '') ? undefined : s;
+    };
+
+    return {
+      action,
+      selector: cleanSel(parsed.selector),
+      value: typeof parsed.value === 'string' ? parsed.value : undefined,
+      fieldType,
+      waitMs: typeof parsed.waitMs === 'number' ? parsed.waitMs : 2000,
+      commentary: String(parsed.commentary || 'AI action'),
+      confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence as number)) : 0.5
+    };
+  } catch (error) {
+    console.error('AutoLogin AI: decideNextAction error:', error);
+    return null;
+  }
+}
+
+export default { analyzePageForLogin, analyzeLoginFailure, logAIInteraction, decideNextAction, AI_CONFIG };

@@ -662,7 +662,14 @@ Action rules:
 CRITICAL rules — read these carefully:
 - If you see a validation error like "Password can't be blank" or "field is required", the field was NOT filled correctly. You MUST type into that field again before clicking submit — never click submit when a required field shows a blank/empty error.
 - If a password field looks empty or shows its placeholder text, type the password into it even if your history says you already typed it. Always trust what you SEE in the screenshot over your history.
-- Never click the submit button if any required field appears empty or shows a validation error.`;
+- Never click the submit button if any required field appears empty or shows a validation error.
+
+CAPTCHA rules — very important:
+- Counting/symbol CAPTCHAs ("Count the symbols", "How many triangles?", "X + Y = ?"): COUNT the shapes/symbols in the image yourself and TYPE the numeric answer into the input field. Do NOT use report_captcha for these — you can solve them.
+- Math CAPTCHAs ("3 + 5 = ?", "12 - 4 = ?"): CALCULATE the answer and TYPE it. Do NOT use report_captcha.
+- Text/distorted-word CAPTCHAs: READ the letters and TYPE them.
+- Only use "report_captcha" for image-SELECTION challenges where a human must click specific image tiles (hCaptcha grids, reCAPTCHA "select all traffic lights").
+- After typing a CAPTCHA answer, click the verify/submit button for that CAPTCHA.`;
 
   try {
     const response = await callAIWithVision(prompt, screenshotBase64);

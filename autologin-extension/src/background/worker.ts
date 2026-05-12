@@ -25,7 +25,6 @@ import {
   ExportLogsResponse,
   GetStatsResponse,
   CleanupDbResponse,
-  SaveSuccessFileResponse,
   ExportSuccessLogResponse,
   ClearBrowserCookiesResponse,
   StartBatchLoginResponse,
@@ -239,7 +238,8 @@ async function recordSuccess(
   accountId: string, url: string, username: string,
   cookies: chrome.cookies.Cookie[]
 ): Promise<void> {
-  const hostname = new URL(url).hostname;
+  let hostname: string;
+  try { hostname = new URL(url).hostname; } catch { hostname = url; }
   const ts = new Date().toISOString();
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -248,7 +248,9 @@ async function recordSuccess(
     log.push({ accountId, hostname, url, username, timestamp: ts, cookiesCount: cookies.length });
     if (log.length > 500) log.shift();
     await new Promise<void>(res => chrome.storage.local.set({ successLog: log }, res));
-  } catch { /* non-fatal */ }
+  } catch (err) {
+    console.warn('AutoLogin: recordSuccess storage write failed:', err);
+  }
 }
 
 async function clearBrowserCookiesFor(url: string): Promise<void> {
@@ -922,12 +924,6 @@ registerHandler(MESSAGE_TYPES.GET_BATCH_STATUS, async (_data, _sender) => {
 // File / Cookie Handlers
 // ============================================================================
 
-registerHandler(MESSAGE_TYPES.SAVE_SUCCESS_FILE, async (_rawData, _sender) => {
-  // Deprecated: auto-download of plaintext files removed for security.
-  // Use EXPORT_SUCCESS_LOG instead, which is user-triggered from the popup.
-  return createResponse<SaveSuccessFileResponse>({ saved: false });
-});
-
 registerHandler(MESSAGE_TYPES.EXPORT_SUCCESS_LOG, async (_rawData, _sender) => {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -936,7 +932,10 @@ registerHandler(MESSAGE_TYPES.EXPORT_SUCCESS_LOG, async (_rawData, _sender) => {
 
     // For each success entry, load its cookies from IndexedDB
     const rows = await Promise.all(log.map(async entry => {
-      const cookies = await cookieStore.loadCookies(entry.accountId).catch(() => []);
+      const cookies = await cookieStore.loadCookies(entry.accountId).catch(err => {
+        console.warn(`AutoLogin: export — cookie load failed for ${entry.accountId}:`, err);
+        return [];
+      });
       return {
         hostname: entry.hostname,
         url: entry.url,

@@ -1,245 +1,229 @@
-# AutoLogin — Bulk Login Automation Extension
+# AutoLogin — AI-Orchestrated Bulk Login Extension
 
-**AutoLogin** is a Chrome and Firefox browser extension that logs into multiple websites automatically. You give it a list of accounts, press one button, and it handles everything — opening each site, finding the login form, typing your credentials, dealing with CAPTCHAs, and saving the session cookies. No manual work. No per-site configuration.
+**AutoLogin** is a Chrome and Firefox browser extension that logs into multiple websites automatically. Give it a list of accounts, press one button, and it handles everything — opening each site, visually analyzing the login form via AI, filling credentials, handling Cloudflare verification and CAPTCHAs, capturing cookies, and moving on to the next account.
 
-Built with real engineering: TypeScript, encrypted local storage, a typed message bus, and an AI vision system that reads login pages the same way a human would — by looking at them.
+Built for serious use: TypeScript strict mode, per-password encryption, a typed message bus, MV3 service worker resilience, and an AI vision loop that sees the page the same way a human does.
 
 ---
 
-## What It Does
+## What Makes This Different
 
-Most bulk login tools require you to write custom selectors for every website — essentially telling the tool "the email field is called `#login-email` on this site." AutoLogin skips that entirely. Instead it takes a screenshot of the current page and asks an AI: *"what step is this, and what are the field selectors?"* The AI reads the page visually, returns CSS selectors, and the extension fills them in.
+Most bulk login tools require you to write CSS selectors for every site: *"the email field is `#login-email` on this site."* AutoLogin replaces that with a vision loop:
 
-This means it works on sites it has never seen before, handles sites that change their layout, and deals with multi-step flows (like Google's email → Next → password → Sign in) without any configuration.
+1. Take a screenshot of the current tab
+2. Ask an AI: *"what do you see, and what is the single next action?"*
+3. Execute that one action (type into a field, click a button, wait for a redirect)
+4. Repeat from step 1 until success or failure
+
+The AI reads the page visually — it works on sites it has never seen before, handles layouts that change, deals with multi-step flows (email → Next → password → Submit), and self-corrects when an action does not take effect.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  popup.js  (React 18)                                           │
+│  Live AI feed · Batch controls · Escalation UI · Export         │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │  chrome.runtime.sendMessage (typed)
+┌───────────────────────▼─────────────────────────────────────────┐
+│  background.js  (MV3 Service Worker)                            │
+│                                                                 │
+│  Single `batch_tick` alarm drives the entire state machine.     │
+│  State is stored in chrome.storage.local so the worker         │
+│  survives the MV3 30-second idle kill and resumes cleanly.      │
+│                                                                 │
+│  Per-account flow:                                              │
+│    startNextAccount() → open tab (active) → save state →       │
+│    [alarm tick] → executeOrchestrationStep() loop:             │
+│      screenshot → decideNextAction() → EXECUTE_DOM_ACTION →    │
+│      save step → reschedule tick → repeat                      │
+│                                                                 │
+│  Owns all IndexedDB writes via Dexie (credentials, cookies,    │
+│  logs). Popup and content script never touch the DB directly.  │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │  chrome.tabs.sendMessage
+┌───────────────────────▼─────────────────────────────────────────┐
+│  content.js  (injected at document_start on all URLs)           │
+│  EXECUTE_DOM_ACTION · form detection · logout · screenshots     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Source Layout
+
+```
+src/
+├── background/worker.ts        Alarm-driven state machine + all message handlers
+├── content/contentMain.ts      DOM interaction: type, click, detect, screenshot
+├── popup/popup.tsx             React UI: live AI feed, batch controls, export
+├── automation/
+│   ├── ai-agent.ts             Vision API calls + decideNextAction() orchestrator
+│   ├── engine.ts               DOM-based form detection fallback
+│   ├── captcha.ts              CAPTCHA detection
+│   └── anti-detection.ts       Human-like timing and event sequencing
+├── store/database.ts           Dexie/IndexedDB schema + CRUD
+├── crypto/encryption.ts        TweetNaCl XSalsa20-Poly1305 + key derivation
+├── messaging/
+│   ├── types.ts                Discriminated union message types + response map
+│   ├── handlers.ts             Handler registry
+│   └── messenger.ts            Promise-wrapped sendMessage with timeout
+└── types/index.ts              Shared interfaces
+```
 
 ---
 
 ## Feature Overview
 
-### Core Automation
-- **Batch login** — queue hundreds of accounts and process them one by one
-- **Multi-step flow support** — handles email-first flows (Google, Microsoft, Yahoo, LinkedIn, and most modern login pages)
-- **Up to 6 login steps per account** — enough for email → CAPTCHA → password → 2FA flows
-- **Pause and resume** — stop the batch at any time and pick up where you left off
-- **Configurable delay** between accounts (set in Developer tab)
-- **Cookie capture** — after each successful login, all session cookies are saved to a text file via `chrome.downloads`
-- **Per-account login history** — every attempt is logged with status, timestamp, and error detail
+### AI Orchestration Loop
+- **Per-action vision loop** — one screenshot → one AI decision → one DOM action → repeat
+- **Step history** — AI receives the last 5 actions in context so it can reason about what has already been tried
+- **Template learning** — after the first successful login on a hostname, the selector sequence is saved; subsequent accounts on the same site use the template as a hint, reducing AI calls needed
+- **Escalation** — after 3 consecutive failures on the same hostname, the batch pauses and asks for a plain-English instruction (e.g. "click Accept Cookies first"). The AI incorporates it and retries
+- **Live feed** — every AI action streams into the popup in real time with action type, account, and commentary
 
-### AI Vision System
-- Takes a live screenshot of the current tab using `chrome.tabs.captureVisibleTab`
-- Sends the screenshot to an AI vision model with a structured prompt
-- AI identifies: what login step is showing, CSS selectors for each field, whether a CAPTCHA is present
-- Falls back to DOM-based detection if AI is not configured or unavailable
-- Supports multiple AI providers (see AI Providers section below)
+### Service Worker Resilience (MV3)
+MV3 service workers are killed after 30 seconds of inactivity. The extension survives this:
+- All batch state lives in `chrome.storage.local`, not in-memory
+- A `batch_tick` alarm is scheduled **before** every long wait (page load, DOM action). If the worker dies during the wait, the alarm fires later, the worker restarts, reads state, takes a fresh screenshot, and continues
+- The AI re-evaluates from the current visual page state on restart — no stale assumptions
 
-### Form Detection & Filling
-- **AI-powered**: vision model reads the page like a human and returns exact selectors
-- **DOM fallback**: queries `input[type="email"]`, `input[type="password"]`, `button[type="submit"]` and related patterns; filters to visible elements only; handles React/Angular controlled inputs via native input setter
-- **Visibility filtering** — hidden or off-screen fields are skipped
-- **Multi-strategy button detection** — checks `type="submit"`, text content (`next`, `sign in`, `continue`), `aria-label`, `title`, and `data-testid` attributes
-- **React/Angular compatibility** — uses `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set` to trigger framework state updates properly
-
-### Human-Like Behavior
-- Fields are filled with random per-character delays
-- Mouse events (focus, input, change, keyup) fired in correct sequence
-- Tab open in background (not active) — less suspicious to bot detection
-- Cookies cleared between accounts to prevent session bleed
+### Form Filling
+- Primary: `document.execCommand('insertText')` — fires the browser-native edit chain that React, Vue, and Angular all intercept to update their internal state
+- Fallback: native `HTMLInputElement.prototype.value` setter + `InputEvent` for non-framework pages
+- Fills are verified: a warning is logged if the field reads back a different value than what was written
 
 ### CAPTCHA Handling
 
-| CAPTCHA Type | What Happens |
+| Type | Action |
 |---|---|
-| reCAPTCHA v2 checkbox ("I'm not a robot") | Clicked automatically |
-| reCAPTCHA v3 (invisible, score-based) | No action needed — extension behaves normally |
-| Text CAPTCHA (distorted letters/words) | AI reads screenshot and types the answer |
-| Math CAPTCHA (e.g. "3 + 5 = ?") | AI solves and types the answer |
-| reCAPTCHA v2 image grid ("select traffic lights") | **Paused** — tab stays open for you to solve manually, then Resume |
-| hCaptcha image challenge | **Paused** — same as above |
+| Cloudflare Turnstile (auto-solve) | AI waits for the widget to complete, then continues |
+| reCAPTCHA v2 checkbox | AI clicks the checkbox |
+| reCAPTCHA v3 (invisible) | No action needed |
+| Text / math CAPTCHA | AI reads the screenshot and types the answer |
+| Image grid / hCaptcha | Batch pauses — solve in the tab, click Continue in popup |
 
-After 2 failed CAPTCHA attempts on the same page, the extension pauses automatically rather than looping into account lockout.
-
-### Storage & Exports
-- Credentials stored in **IndexedDB** (Dexie.js) — encrypted at rest
-- Cookies stored per-account with expiry metadata
-- Logs stored per-account with full status history
-- **Export logs** as CSV or JSON
-- **Success file** saved to your Downloads folder: one `.txt` file per domain with credentials + all cookies captured at login time
-- **Cleanup** — retention policy removes old logs and cookies automatically
+### Batch Controls
+- **Start All** — groups credentials by hostname so all accounts for the same site run together and share templates, then processes in sequence
+- **Stop** — halts after the current account finishes
+- **Continue** — resumes after a CAPTCHA pause
+- **Export Results** — downloads a JSON file with successful logins and their captured cookies (explicit user action, not auto-saved to disk)
 
 ---
 
-## Developer Mode
+## Security Considerations
 
-The extension has a **Developer tab** in the popup specifically built for power users running large batches. This is where most of the control lives.
+This section documents exactly what is stored, where, and in what form.
 
-### Available Controls
+### What Is Encrypted
 
-| Control | What It Does |
+**Credential passwords** are encrypted before being written to IndexedDB using **XSalsa20-Poly1305** (TweetNaCl `secretbox`) — the same algorithm used by Signal. This is authenticated encryption: both confidentiality and tamper-detection.
+
+- 256-bit key derived from a browser-session-specific value via 1000-round NaCl hashing
+- Format: 24-byte random nonce prepended to ciphertext, hex-encoded
+- Stored in the `password_encrypted` column of the `credentials` IndexedDB table
+- A copy of the IndexedDB file without the key is unreadable
+
+### What Is NOT Encrypted at Application Level
+
+**Cookie values** captured after successful logins are stored as plaintext objects in the `cookies` IndexedDB table. They are protected by OS-level browser profile isolation (only your browser process can read them) but are not additionally encrypted by this extension.
+
+**`chrome.storage.local`** holds plaintext JSON for:
+
+| Key | Contents | Contains credentials? |
+|---|---|---|
+| `orchestratorState` | Batch progress, current index, hostname templates, step history | No |
+| `ai_feed` | AI commentary strings for the live popup feed | No |
+| `successLog` | Metadata: hostname, username, timestamp, cookie count | Username only — no password |
+
+No passwords are written to `chrome.storage.local`.
+
+### No Auto-Download of Plaintext Files
+
+Earlier versions of this extension auto-saved a `.txt` file to the Downloads folder containing credentials and cookies in plaintext. **This has been removed.** The Downloads folder is accessible to any process running as your OS user and is not an appropriate location for credential data.
+
+The replacement: cookies are stored in IndexedDB. The **Export Results** button in the popup generates a JSON export on explicit user request. That export includes cookie values (plaintext) — treat the file accordingly and store it somewhere appropriate.
+
+### What the AI Receives
+
+- The AI receives **screenshots** of login pages — visual images of what is visible in the browser tab
+- Screenshots contain page layout, form labels, and button text
+- Screenshots do **not** contain typed passwords (passwords are filled locally after the AI responds)
+- API keys are stored in `chrome.storage.local` on your device and transmitted only to the configured AI provider
+
+### Data Flow Summary
+
+```
+Your password
+  → encrypted (XSalsa20-Poly1305)
+  → stored in IndexedDB credentials table
+  → decrypted in-memory only when the batch processes that account
+  → typed into the login form via EXECUTE_DOM_ACTION in content script
+  → never written to any file or sent to any external server
+
+Cookies captured after login
+  → stored in IndexedDB cookies table (plaintext, OS-profile-protected)
+  → exported via popup "Export Results" button → JSON file, user-triggered
+
+Screenshots taken during the AI loop
+  → captured in-memory by captureVisibleTab / browser.tabs.captureTab
+  → sent to AI provider API
+  → discarded after the AI responds
+  → never written to disk by this extension
+```
+
+### Threat Model
+
+| Scenario | Risk |
 |---|---|
-| **Start Batch Login** | Begins processing all saved credentials in sequence |
-| **Stop Batch** | Halts immediately after the current account finishes |
-| **Resume Batch** | Continues after a CAPTCHA pause or manual stop |
-| **Login Delay (seconds)** | Time to wait between accounts — increase if getting rate-limited |
-| **Live Progress** | Shows `current / total`, current account URL, and batch status |
-| **Dev Logs** | Real-time log feed showing every step: form detected, fields filled, submit clicked, result |
-| **Clear All Data** | Wipes all credentials, logs, cookies from local storage |
+| Someone reads your IndexedDB file without your browser session | Passwords encrypted; cookies exposed |
+| Someone with your OS account opens your browser | Same as any browser password manager |
+| Malware with full OS access | Do not use credential tools in this scenario |
+| Network interception of AI API calls | Only screenshots transmitted; no credentials |
+| AI provider retains your screenshots | Review your provider's data retention policy |
 
-### Status Codes You Will See
+### Legal Notice
 
-| Status | Meaning |
-|---|---|
-| `SUCCESS` | Logged in, cookies saved |
-| `WRONG_PASSWORD` | Form submitted but login rejected |
-| `CAPTCHA_PAUSED` | Waiting for human CAPTCHA solve |
-| `CAPTCHA_TIMEOUT` | CAPTCHA not solved in time |
-| `FORM_NOT_FOUND` | Neither AI nor DOM detection found a login form |
-| `FORM_FILL_FAILED` | Found fields but could not fill them |
-| `FORM_SUBMIT_FAILED` | Filled form but submit button not found or not clickable |
-| `NETWORK_ERROR` | Tab failed to load or URL invalid |
-| `BLOCKED_BY_BOT_DETECTION` | Cloudflare or similar challenge detected |
-| `IN_PROGRESS` | Currently processing |
-
-### Why Some Sites Are Hard Without AI
-
-Without AI vision, the DOM fallback works well on straightforward sites — standard HTML forms with `input[type="email"]` and `input[type="password"]`. It struggles with:
-
-- **Single-page apps** where fields are rendered dynamically after page load
-- **Custom web components** that use shadow DOM and don't expose standard input types
-- **Sites with unusual field names** or attributes
-- **Multi-step flows** where the extension doesn't know whether it's on the email step or password step
-- **Sites that deliberately obscure their field selectors** to prevent automation
-
-With an AI key configured, all of these are handled automatically because the AI is reading the actual rendered page — not trying to guess selector patterns.
-
-We have built in every DOM tweak we reasonably could: visibility filtering, fallback selector chains, button text matching, aria-label checking, React native setter, focus/blur sequencing. But there is a hard limit to what pattern-matching can do on a page it has never been trained on. The AI removes that limit.
+This extension is intended for automating access to accounts you own or have explicit authorization to access. Unauthorized access to computer systems is illegal in most jurisdictions. Bulk automated login may violate the terms of service of some websites. You are responsible for compliance with applicable laws and service agreements. The authors accept no liability for misuse.
 
 ---
 
 ## AI Providers
 
-The AI key is **optional**. The extension runs without it using DOM detection. If you want AI-powered field detection (recommended for best reliability), you can use any of the providers below.
+The AI key is **optional** — the extension works without it using DOM-based form detection. With a key configured, the vision loop handles sites DOM detection cannot.
 
-The key is stored in `chrome.storage.local` on your device only. It is configured in **Options → AI Settings** and never touches source code.
+Keys are configured in **Options → AI Settings** and stored only in `chrome.storage.local` on your device.
 
----
+### Free Options
 
-### Free Options (No Credit Card Required)
+**Pollinations AI** (`gen.pollinations.ai`) — primary provider, OpenAI-compatible endpoint. Works without an API key for text models; vision requires a Pollinations account.
 
-#### OpenRouter — Recommended Free Option
-**Site:** [openrouter.ai/keys](https://openrouter.ai/keys)
+**OpenRouter** (`openrouter.ai/keys`) — routes to many models. Several have completely free tiers:
 
-OpenRouter is a unified API that routes to many different models. Several are completely free with no billing setup required. The extension uses these by default:
-
-| Model | Why Used |
+| Model | Role |
 |---|---|
-| `baidu/qianfan-ocr-fast:free` | Primary — fast, reliable, good at structured text extraction from images |
-| `google/gemma-4-31b-it:free` | Secondary — higher quality when not rate-limited |
-| `google/gemma-4-26b-a4b-it:free` | Tertiary fallback |
-| `nvidia/nemotron-nano-12b-v2-vl:free` | Last resort |
+| `qwen/qwen2.5-vl-72b-instruct:free` | Primary — best free vision model |
+| `meta-llama/llama-3.2-90b-vision-instruct:free` | Secondary |
+| `google/gemini-2.0-flash-exp:free` | Tertiary |
+| `google/gemma-3-27b-it:free` | Last resort |
 
-The extension tries them in order and uses the first one that responds. Cost for typical batch usage: **zero**.
+The extension tries Pollinations first, then falls back through OpenRouter models automatically.
 
-```
-Provider: OpenRouter
-Key format: sk-or-v1-...
-Set in: Options → AI Settings
-```
+### Paid Options
 
-#### Pollinations AI — Completely Free, No Key Needed
-**Site:** [pollinations.ai](https://pollinations.ai)
-
-Pollinations runs a free public API with no authentication. The catch: their free anonymous endpoint currently only exposes text models without vision capability. Their paid `gen.pollinations.ai` endpoint has vision models (OpenAI, Gemini, Claude) but requires credits.
-
-**Current status:** Pollinations free tier does not support vision. If they add a free vision model to `text.pollinations.ai` in the future, it will be the best zero-config option.
-
----
-
-### Paid Options (Best Quality)
-
-#### OpenAI
-**Site:** [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
-
-GPT-4o and GPT-4o-mini both have vision capability. GPT-4o-mini is cheap enough that analyzing thousands of login pages costs cents.
-
-```
-Base URL: https://api.openai.com/v1
-Model: gpt-4o-mini  (cheapest with vision)
-Model: gpt-4o       (highest accuracy)
-Key format: sk-...
-Estimated cost: ~$0.01 per 1,000 logins
-```
-
-To use OpenAI: configure the base URL and model in the extension source (`src/automation/ai-agent.ts`) and put your key in Options → AI Settings.
-
-#### Anthropic (Claude)
-**Site:** [console.anthropic.com](https://console.anthropic.com)
-
-Claude has strong instruction-following and returns clean JSON reliably. Claude 3 Haiku is fast and inexpensive.
-
-```
-Base URL: https://api.anthropic.com/v1
-Model: claude-haiku-4-5  (fast, cheap)
-Model: claude-sonnet-4-6 (best accuracy)
-Key format: sk-ant-...
-Note: Requires x-api-key header instead of Bearer token
-```
-
-#### Google Gemini
-**Site:** [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
-
-Gemini 2.0 Flash is free up to generous rate limits on Google AI Studio. Gemini 1.5 Pro has the largest context window of any model listed here.
-
-```
-Base URL: https://generativelanguage.googleapis.com/v1beta/openai
-Model: gemini-2.0-flash   (free tier available)
-Model: gemini-1.5-pro     (highest quality)
-Key format: AIza...
-```
-
-#### Qwen (Alibaba Cloud)
-**Site:** [dashscope.aliyuncs.com](https://dashscope.aliyuncs.com)
-
-Qwen VL (Vision Language) models are strong at OCR and structured page analysis. Qwen-VL-Max has competitive accuracy with GPT-4o on visual tasks.
-
-```
-Base URL: https://dashscope.aliyuncs.com/compatible-mode/v1
-Model: qwen-vl-max
-Model: qwen-vl-plus  (cheaper)
-Key format: sk-...
-```
-
-#### DeepSeek
-**Site:** [platform.deepseek.com](https://platform.deepseek.com)
-
-DeepSeek-VL2 is a capable open-source vision model available via API at very low cost. Good option if you want OpenAI-compatible API calls with lower billing.
-
-```
-Base URL: https://api.deepseek.com/v1
-Model: deepseek-vl2
-Key format: sk-...
-Estimated cost: significantly lower than OpenAI
-```
-
----
-
-### Summary Table
-
-| Provider | Cost | Vision | Key Required | Best For |
-|---|---|---|---|---|
-| OpenRouter (free models) | Free | ✅ | Yes (free) | Default recommendation |
-| Pollinations AI | Free | ❌ (currently) | No | Future option if vision added |
-| Google Gemini (AI Studio) | Free tier | ✅ | Yes (free) | High quality free option |
-| OpenAI GPT-4o-mini | ~$0.01/1K logins | ✅ | Yes (paid) | Best reliability |
-| Anthropic Claude Haiku | ~$0.01/1K logins | ✅ | Yes (paid) | Best instruction following |
-| Qwen VL | Low cost | ✅ | Yes (paid) | Strong OCR accuracy |
-| DeepSeek VL2 | Very low cost | ✅ | Yes (paid) | Budget paid option |
-| None (DOM only) | Free | N/A | No | Simple sites only |
+| Provider | Model | Estimated Cost | Notes |
+|---|---|---|---|
+| OpenAI | `gpt-4o-mini` | ~$0.01 / 1K logins | Best reliability |
+| Anthropic | `claude-haiku-4-5` | ~$0.01 / 1K logins | Best instruction-following |
+| Google Gemini | `gemini-2.0-flash` | Free tier generous | AI Studio key |
+| Qwen VL | `qwen-vl-max` | Low | Strong OCR |
+| DeepSeek | `deepseek-vl2` | Very low | OpenAI-compatible |
 
 ---
 
 ## Setup
 
-### 1. Build from Source
+### 1. Build
 
 ```bash
 git clone https://github.com/staimoorulhassan/Autologin_Extension
@@ -250,210 +234,71 @@ npm run build
 
 ### 2. Load in Browser
 
-**Chrome:**
-1. Go to `chrome://extensions`
-2. Enable **Developer Mode** (top right toggle)
-3. Click **Load unpacked**
-4. Select the `dist/` folder
+**Chrome / Edge:**
+1. `chrome://extensions` → Enable **Developer Mode**
+2. **Load unpacked** → select the `dist/` folder
 
 **Firefox:**
-1. Go to `about:debugging#/runtime/this-firefox`
-2. Click **Load Temporary Add-on**
-3. Select `dist/manifest.json`
+1. `about:debugging#/runtime/this-firefox`
+2. **Load Temporary Add-on** → select `dist/manifest.json`
 
-### 3. Configure AI Key (Optional but Recommended)
+For persistent Firefox loading: `npm run web-ext:run`
 
-1. Get a free key from [openrouter.ai/keys](https://openrouter.ai/keys)
-2. Click the extension icon in your browser toolbar
-3. Click **Options**
-4. Find **AI Settings** → paste your key → click **Save**
+### 3. Configure AI Key (Optional)
 
-### 4. Import Your Credentials
+1. Get a free key at [openrouter.ai/keys](https://openrouter.ai/keys)
+2. Extension icon → **Options** → **AI Settings** → paste key → **Save**
 
-Open Options and paste credentials in either format:
+### 4. Import Credentials
 
-**CSV format:**
-```
+In Options, paste CSV or colon-delimited format:
+
+```csv
 url,username,password
 https://github.com,user@email.com,mypassword
 https://reddit.com,myusername,pass456
-https://twitter.com,handle,pass789
 ```
 
-**Colon-delimited format:**
 ```
 https://github.com:user@email.com:mypassword
 https://reddit.com:myusername:pass456
-https://twitter.com:handle:pass789
 ```
-
-Hundreds of lines work fine. The importer processes them in sequence.
 
 ### 5. Run
 
-Click the extension icon → **Developer** tab → **Start Batch Login**.
+Extension icon → **Developer** tab → **▶ Start All**
 
-The extension opens each site in a background tab, handles the login flow, saves results, closes the tab, and moves to the next account. Progress shows live in the popup.
-
----
-
-## Security
-
-This section is written for people who are not technical. We explain exactly what happens to your passwords, in plain language.
-
----
-
-### Where Your Passwords Are Stored
-
-Your passwords **never leave your computer** except to be sent directly to the login page of the website they belong to — the same thing that happens when you type them manually.
-
-They are stored inside your browser, in a database called IndexedDB. This is the same technology browsers use to store offline app data. It sits inside your browser's profile folder on your hard drive.
-
----
-
-### Encryption
-
-Before any password is saved to that database, it is **encrypted**. This means it is scrambled into unreadable gibberish using a mathematical process. The encryption we use is called **XSalsa20-Poly1305**, implemented through a library called TweetNaCl.js.
-
-To give you a reference point: this is the same encryption algorithm used by Signal, the private messaging app recommended by security researchers worldwide. It is considered one of the strongest encryption methods available.
-
-What this means practically:
-- If someone copies your browser's database file off your hard drive, all they get is scrambled data
-- There is no way to read the passwords without the decryption key
-- The decryption key is tied to your specific browser session
-
----
-
-### What the Encryption Key Is (And Its Limitation)
-
-The encryption key is derived from your browser profile. This means:
-
-- The passwords can only be read inside your browser, on your computer
-- They **cannot** be read on someone else's computer, even if they have the database file
-- **However:** if someone else has access to your Windows/Mac login, and they open your browser, they could in theory access the extension
-
-This is the same limitation as any browser password manager (including Chrome's built-in one). If your computer account is shared or compromised, your browser data is too.
-
-**Recommendation:** Use this extension on a computer that only you have access to. Lock your computer when you leave it.
-
----
-
-### The AI Key
-
-When you configure an AI provider key, it is stored in `chrome.storage.local` — the same secure storage area the extension uses for everything. It is:
-
-- Never written into the extension's source code
-- Never sent to any server except directly to the AI provider you chose
-- Removed if you clear the extension data
-
-The AI receives screenshots of login pages to help identify form fields. Screenshots contain page layout and content — **they do not contain your passwords**. The password is filled into the form locally, after the AI has already responded.
-
----
-
-### What the Extension Can and Cannot Access
-
-**Can access:**
-- Any website you navigate to (required to fill forms)
-- Browser cookies (required to save session after login)
-- Browser downloads (required to save the output file)
-- Browser tabs (required to open and track login pages)
-
-**Cannot access:**
-- Other extensions
-- Files on your computer outside the Downloads folder
-- Your browser history
-- Any data on websites you are not actively logging into
-
----
-
-### Honest Risk Assessment
-
-We believe in being straightforward about risk rather than hiding it.
-
-**Low risk scenario:** You are using this on your personal computer, you are the only person who uses it, and you have a normal OS login. The extension is as secure as your browser's built-in password manager.
-
-**Medium risk scenario:** Multiple people have access to your Windows/Mac account, or your computer runs without a password. In this case, anyone with physical access could access your credentials.
-
-**High risk scenario:** Your computer is shared, managed by an organization with admin access, or you have malware installed. Do not use a credential-storing tool of any kind in this scenario.
-
-**Sites with bot protection:** Bulk automated logins will trigger security systems on some sites. Google, for example, will lock accounts after repeated failed attempts. Start with a small test batch and review results before running hundreds of accounts. Always comply with the terms of service of the sites you are accessing.
-
----
-
-### ⚠️ Legal Disclaimer
-
-> This extension is provided for legitimate automation of accounts you own. Only use it on accounts that belong to you or that you have explicit authorization to access. Unauthorized access to computer systems is illegal in most jurisdictions. The authors of this software take no legal responsibility for misuse. Bulk login automation may violate the terms of service of some websites — you are responsible for compliance.
-
----
-
-## Architecture (For Technical Readers)
-
-```
-Extension Structure
-───────────────────
-background.js      ← Service worker. All database writes happen here.
-                     Orchestrates the batch, manages state, calls AI.
-
-content.js         ← Injected into every page. Fills forms, clicks buttons,
-                     detects CAPTCHAs, captures screenshots locally.
-
-popup.js           ← React 18 UI. Shows status, credentials list,
-                     batch controls, live logs. Never touches the DB directly.
-
-options.html/js    ← Credential import page. API key configuration.
-
-Source Layout
-─────────────
-src/
-├── background/worker.ts        Message router + batch orchestrator
-├── content/contentMain.ts      DOM interaction handlers
-├── popup/popup.tsx             React UI
-├── automation/
-│   ├── ai-agent.ts             OpenRouter/AI vision integration
-│   ├── engine.ts               DOM-based form detection fallback
-│   ├── captcha.ts              CAPTCHA detection logic
-│   └── anti-detection.ts       Bot detection countermeasures
-├── store/database.ts           Dexie/IndexedDB schema + CRUD
-├── crypto/encryption.ts        TweetNaCl encrypt/decrypt + key derivation
-├── messaging/                  Typed Chrome runtime message bus
-│   ├── types.ts                Discriminated union message types
-│   ├── handlers.ts             Handler registry pattern
-│   └── messenger.ts            Promise-wrapped sendMessage with timeout
-└── types/index.ts              Shared TypeScript interfaces
-```
-
-**Key design decisions:**
-- The content script and popup have **zero database access** — all reads/writes go through the background worker via messages
-- Deleting a credential **cascades** automatically to its cookies, logs, and screenshots
-- The message bus has a **5 second timeout** by default; login flows use extended timeouts where needed
-- All TypeScript is **strict mode** — `noImplicitAny`, `strictNullChecks`, `noUnusedLocals`
-- 389 tests across crypto, store, messaging, and automation modules
+Watch the Live AI Feed for real-time action commentary. When the batch finishes (or at any point), click **⬇ Export Results (JSON)** to download all captured cookies as a JSON file.
 
 ---
 
 ## Development
 
 ```bash
-npm run dev           # Watch mode — rebuilds dist/ on every save
+npm run dev           # Webpack watch mode — rebuilds dist/ on save
 npm run build         # Production build
-npm test              # Full test suite (389 tests)
 npm run type-check    # TypeScript strict check — must stay at 0 errors
 npm run lint          # ESLint
+npm test              # Full Jest suite
+npm run web-ext:run   # Launch Firefox with dist/ loaded, auto-reload on change
 ```
 
-**Tech stack:**
-- TypeScript 5 (strict)
-- React 18
-- Webpack 5
-- Dexie.js (IndexedDB)
-- TweetNaCl (encryption)
-- Jest + ts-jest (testing)
-- Chrome/Firefox Manifest V3
+**Stack:** TypeScript 5 strict · React 18 · Webpack 5 · Dexie.js · TweetNaCl · Jest + ts-jest · Chrome/Firefox MV3
+
+---
+
+## Status Codes
+
+| Code | Meaning |
+|---|---|
+| `SUCCESS` | Logged in, cookies captured |
+| `WRONG_PASSWORD` | Form submitted but login rejected |
+| `CAPTCHA_TIMEOUT` | CAPTCHA not solved in time |
+| `FORM_NOT_FOUND` | No login form found within max steps |
+| `IN_PROGRESS` | Currently being processed |
 
 ---
 
 ## License
 
-MIT License. Free to use, modify, and distribute.
-
-See the Security and Disclaimer sections above before deploying in any sensitive environment.
+MIT — free to use, modify, and distribute. See Security Considerations above before deploying in any environment where the threat model matters.

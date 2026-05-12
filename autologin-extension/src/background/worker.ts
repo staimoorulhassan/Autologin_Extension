@@ -26,6 +26,7 @@ import {
   GetStatsResponse,
   CleanupDbResponse,
   SaveSuccessFileResponse,
+  ExportSuccessLogResponse,
   ClearBrowserCookiesResponse,
   StartBatchLoginResponse,
   ResumeBatchLoginResponse,
@@ -222,45 +223,32 @@ async function captureTabScreenshot(tabId: number): Promise<string | null> {
   }
 }
 
-type SaveableCookie = { name: string; value: string; domain: string; path: string; expirationDate?: number; expires?: number };
+interface SuccessLogEntry {
+  accountId: string;
+  hostname: string;
+  url: string;
+  username: string;
+  timestamp: string;
+  cookiesCount: number;
+}
 
-async function saveSuccessToFile(
-  url: string, username: string, password: string,
-  cookies: SaveableCookie[], timestamp: string | number | undefined
+// Records a success entry WITHOUT credentials or cookie values in storage.
+// Cookies are already persisted encrypted in IndexedDB via cookieStore.saveCookies.
+// Plaintext file downloads are intentionally removed — use the popup Export button instead.
+async function recordSuccess(
+  accountId: string, url: string, username: string,
+  cookies: chrome.cookies.Cookie[]
 ): Promise<void> {
   const hostname = new URL(url).hostname;
-  const ts = timestamp == null
-    ? new Date().toISOString()
-    : typeof timestamp === 'number' ? new Date(timestamp).toISOString() : String(timestamp);
-
-  const cookieLines = cookies.map(c => {
-    const expiry = c.expirationDate ?? (c.expires ? c.expires / 1000 : undefined);
-    return `Name: ${c.name}\nValue: ${c.value}\nDomain: ${c.domain}\nPath: ${c.path}\nExpires: ${expiry ? new Date(expiry * 1000).toISOString() : 'Session'}\n---`;
-  }).join('\n');
-
-  const content = [
-    '=== Login Success ===',
-    `URL: ${url}`, `Username: ${username}`, `Password: ${password}`, `Timestamp: ${ts}`,
-    '', '=== Cookies ===', cookieLines
-  ].join('\n');
-
+  const ts = new Date().toISOString();
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const stored = await new Promise<any>(res => chrome.storage.local.get('successLog', res));
-    const log: object[] = stored['successLog'] || [];
-    log.push({ hostname, url, username, password, timestamp: ts, cookiesCount: cookies.length });
-    if (log.length > 100) log.shift();
+    const log: SuccessLogEntry[] = (stored['successLog'] as SuccessLogEntry[]) || [];
+    log.push({ accountId, hostname, url, username, timestamp: ts, cookiesCount: cookies.length });
+    if (log.length > 500) log.shift();
     await new Promise<void>(res => chrome.storage.local.set({ successLog: log }, res));
   } catch { /* non-fatal */ }
-
-  try {
-    const blob = new Blob([content], { type: 'text/plain' });
-    const blobUrl = URL.createObjectURL(blob);
-    chrome.downloads.download(
-      { url: blobUrl, filename: `${hostname}-${username}-${Date.now()}.txt`, saveAs: false, conflictAction: 'overwrite' },
-      () => setTimeout(() => URL.revokeObjectURL(blobUrl), 1000)
-    );
-  } catch { /* expected in Firefox */ }
 }
 
 async function clearBrowserCookiesFor(url: string): Promise<void> {
@@ -488,8 +476,8 @@ async function handleAccountSuccess(
     chrome.cookies.getAll({ url: account.url }, res)
   );
 
-  await saveSuccessToFile(account.url, account.username, account.password, liveCookies, new Date().toISOString())
-    .catch(e => console.warn('AutoLogin: File save failed:', e));
+  await recordSuccess(account.id, account.url, account.username, liveCookies)
+    .catch(e => console.warn('AutoLogin: recordSuccess failed:', e));
 
   const dbCookies: Cookie[] = liveCookies.map(c => ({
     account_id: account.id,
@@ -934,15 +922,40 @@ registerHandler(MESSAGE_TYPES.GET_BATCH_STATUS, async (_data, _sender) => {
 // File / Cookie Handlers
 // ============================================================================
 
-registerHandler(MESSAGE_TYPES.SAVE_SUCCESS_FILE, async (rawData, _sender) => {
+registerHandler(MESSAGE_TYPES.SAVE_SUCCESS_FILE, async (_rawData, _sender) => {
+  // Deprecated: auto-download of plaintext files removed for security.
+  // Use EXPORT_SUCCESS_LOG instead, which is user-triggered from the popup.
+  return createResponse<SaveSuccessFileResponse>({ saved: false });
+});
+
+registerHandler(MESSAGE_TYPES.EXPORT_SUCCESS_LOG, async (_rawData, _sender) => {
   try {
-    const data = d<{ url: string; username: string; password: string; cookies?: Cookie[]; timestamp?: number }>(rawData);
-    await saveSuccessToFile(data.url, data.username, data.password, data.cookies ?? [], data.timestamp);
-    return createResponse<SaveSuccessFileResponse>({
-      saved: true, filename: `logscomplete\\${new URL(data.url).hostname}-correct.txt`
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stored = await new Promise<any>(res => chrome.storage.local.get('successLog', res));
+    const log: SuccessLogEntry[] = (stored['successLog'] as SuccessLogEntry[]) || [];
+
+    // For each success entry, load its cookies from IndexedDB
+    const rows = await Promise.all(log.map(async entry => {
+      const cookies = await cookieStore.loadCookies(entry.accountId).catch(() => []);
+      return {
+        hostname: entry.hostname,
+        url: entry.url,
+        username: entry.username,
+        timestamp: entry.timestamp,
+        cookiesCount: entry.cookiesCount,
+        cookies: cookies.map(c => ({
+          name: c.name, value: c.value, domain: c.domain,
+          path: c.path, expires: c.expires, secure: c.secure, httpOnly: c.httpOnly
+        }))
+      };
+    }));
+
+    return createResponse<ExportSuccessLogResponse>({
+      json: JSON.stringify(rows, null, 2),
+      count: rows.length
     });
   } catch (error) {
-    return createErrorResponse(`Failed to save file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    return createErrorResponse(`Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 });
 

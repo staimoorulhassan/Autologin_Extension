@@ -182,7 +182,10 @@ export class AutomationEngine {
     }
 
     // Check for hCaptcha
-    if (html.includes('h-captcha') || html.includes('hcaptcha.com')) {
+    // Use anchored regex for the domain check: 'hcaptcha.com' must be the hostname,
+    // not a substring of a path (e.g. evil.com/hcaptcha.com/) or another domain.
+    const hcaptchaDomainRe = /[\s"'(]https?:\/\/(?:[a-z0-9-]+\.)*hcaptcha\.com[/?#"'\s]/i;
+    if (html.includes('h-captcha') || hcaptchaDomainRe.test(html)) {
       const sitekey = this.extractSitekey(html, 'data-sitekey="([^"]+)"');
       return {
         found: true,

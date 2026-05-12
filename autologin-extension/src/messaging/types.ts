@@ -34,6 +34,7 @@ export type BackgroundMessageType =
   | 'GET_STATS'
   | 'CLEANUP_DB'
   | 'SAVE_SUCCESS_FILE'
+  | 'EXPORT_SUCCESS_LOG'
   | 'CLEAR_BROWSER_COOKIES'
   | 'START_BATCH_LOGIN'
   | 'STOP_BATCH_LOGIN'
@@ -78,6 +79,7 @@ export const MESSAGE_TYPES = {
   CLEANUP_DB: 'CLEANUP_DB',
 
   SAVE_SUCCESS_FILE: 'SAVE_SUCCESS_FILE',
+  EXPORT_SUCCESS_LOG: 'EXPORT_SUCCESS_LOG',
   CLEAR_BROWSER_COOKIES: 'CLEAR_BROWSER_COOKIES',
   START_BATCH_LOGIN: 'START_BATCH_LOGIN',
   STOP_BATCH_LOGIN: 'STOP_BATCH_LOGIN',
@@ -171,6 +173,10 @@ export interface SaveSuccessFileMessage {
   data: { url: string; username: string; password: string; cookies: chrome.cookies.Cookie[]; timestamp: string };
 }
 
+export interface ExportSuccessLogMessage {
+  type: 'EXPORT_SUCCESS_LOG';
+}
+
 export interface ClearBrowserCookiesMessage {
   type: 'CLEAR_BROWSER_COOKIES';
   data: { url: string };
@@ -224,6 +230,7 @@ export type BackgroundMessage =
   | GetStatsMessage
   | CleanupDbMessage
   | SaveSuccessFileMessage
+  | ExportSuccessLogMessage
   | ClearBrowserCookiesMessage
   | StartBatchLoginMessage
   | StopBatchLoginMessage
@@ -390,6 +397,11 @@ export interface ClearBrowserCookiesResponse {
   cleared: number;
 }
 
+export interface ExportSuccessLogResponse {
+  json: string;      // JSON string — popup creates the Blob and triggers download
+  count: number;     // how many success entries are in the export
+}
+
 export interface BatchProgress {
   total: number;
   completed: number;
@@ -508,6 +520,7 @@ export interface MessageResponseMap {
   GET_STATS: GetStatsResponse;
   CLEANUP_DB: CleanupDbResponse;
   SAVE_SUCCESS_FILE: SaveSuccessFileResponse;
+  EXPORT_SUCCESS_LOG: ExportSuccessLogResponse;
   CLEAR_BROWSER_COOKIES: ClearBrowserCookiesResponse;
   START_BATCH_LOGIN: StartBatchLoginResponse;
   STOP_BATCH_LOGIN: StopBatchLoginResponse;

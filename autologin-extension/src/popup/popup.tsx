@@ -7,7 +7,7 @@
 import { useState, useEffect, useRef } from 'react';
 import ReactDOM from 'react-dom/client';
 import { sendToBackground, MESSAGE_TYPES, TimeoutError } from '@messaging/index';
-import type { BatchProgress } from '@messaging/types';
+import type { BatchProgress, ExportSuccessLogResponse } from '@messaging/types';
 import type { Credential, LoginLog } from '../types/index';
 import AiChat from './components/AiChat';
 
@@ -173,6 +173,25 @@ function App() {
     setDevMessage(resp.success ? 'All data cleared' : 'Clear failed');
     setAiFeed([]);
     await fetchCredentials();
+  }
+
+  async function handleExportResults() {
+    setDevMessage('Exporting...');
+    try {
+      const resp = await sendToBackground({ type: MESSAGE_TYPES.EXPORT_SUCCESS_LOG });
+      if (!resp.success || !resp.data) { setDevMessage(resp.error ?? 'Export failed'); return; }
+      const { json, count } = resp.data as ExportSuccessLogResponse;
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `autologin-results-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setDevMessage(`Exported ${count} successful login${count !== 1 ? 's' : ''}`);
+    } catch (e) {
+      setDevMessage(`Export error: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   function handleDelayChange(value: number) {
@@ -424,8 +443,11 @@ function App() {
               /> seconds
             </label>
 
-            <div style={{ fontSize: '11px', color: '#666', background: '#fff', padding: '6px 8px', borderRadius: '3px', marginBottom: '8px' }}>
-              <strong>Files save to:</strong> <code style={{ background: '#f5f5f5', padding: '1px 3px' }}>Downloads\(hostname)-(user)-timestamp.txt</code>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+              <button onClick={handleExportResults} style={{
+                flex: 1, padding: '8px', background: '#1a73e8', color: 'white',
+                border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px'
+              }}>⬇ Export Results (JSON)</button>
             </div>
 
             <button onClick={handleClearData} style={{

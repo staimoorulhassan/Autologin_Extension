@@ -33,7 +33,6 @@ export type BackgroundMessageType =
   | 'EXPORT_LOGS'
   | 'GET_STATS'
   | 'CLEANUP_DB'
-  | 'SAVE_SUCCESS_FILE'
   | 'EXPORT_SUCCESS_LOG'
   | 'CLEAR_BROWSER_COOKIES'
   | 'START_BATCH_LOGIN'
@@ -78,7 +77,6 @@ export const MESSAGE_TYPES = {
   GET_STATS: 'GET_STATS',
   CLEANUP_DB: 'CLEANUP_DB',
 
-  SAVE_SUCCESS_FILE: 'SAVE_SUCCESS_FILE',
   EXPORT_SUCCESS_LOG: 'EXPORT_SUCCESS_LOG',
   CLEAR_BROWSER_COOKIES: 'CLEAR_BROWSER_COOKIES',
   START_BATCH_LOGIN: 'START_BATCH_LOGIN',
@@ -168,10 +166,6 @@ export interface CleanupDbMessage {
   data: { maxAgeDays?: number };
 }
 
-export interface SaveSuccessFileMessage {
-  type: 'SAVE_SUCCESS_FILE';
-  data: { url: string; username: string; password: string; cookies: chrome.cookies.Cookie[]; timestamp: string };
-}
 
 export interface ExportSuccessLogMessage {
   type: 'EXPORT_SUCCESS_LOG';
@@ -229,7 +223,6 @@ export type BackgroundMessage =
   | ExportLogsMessage
   | GetStatsMessage
   | CleanupDbMessage
-  | SaveSuccessFileMessage
   | ExportSuccessLogMessage
   | ClearBrowserCookiesMessage
   | StartBatchLoginMessage
@@ -387,11 +380,6 @@ export interface CleanupDbResponse {
   };
 }
 
-export interface SaveSuccessFileResponse {
-  saved: boolean;
-  downloadId?: number;
-  filename?: string;
-}
 
 export interface ClearBrowserCookiesResponse {
   cleared: number;
@@ -519,7 +507,6 @@ export interface MessageResponseMap {
   EXPORT_LOGS: ExportLogsResponse;
   GET_STATS: GetStatsResponse;
   CLEANUP_DB: CleanupDbResponse;
-  SAVE_SUCCESS_FILE: SaveSuccessFileResponse;
   EXPORT_SUCCESS_LOG: ExportSuccessLogResponse;
   CLEAR_BROWSER_COOKIES: ClearBrowserCookiesResponse;
   START_BATCH_LOGIN: StartBatchLoginResponse;

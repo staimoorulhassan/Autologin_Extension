@@ -1,0 +1,1 @@
+AutoLogin automates bulk sign-ins across sites from a supplied credential list. Click Start Batch Login and the extension navigates, detects and fills login fields via an AI-vision screenshot loop, types like a human, handles simple CAPTCHAs, encrypts credentials, and saves session cookies. Stores cookies per domain; creds encrypted in IndexedDB.v1

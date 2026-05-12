@@ -665,9 +665,11 @@ CRITICAL rules — read these carefully:
 - Never click the submit button if any required field appears empty or shows a validation error.
 
 CAPTCHA rules — very important:
-- Counting/symbol CAPTCHAs ("Count the symbols", "How many triangles?", "X + Y = ?"): COUNT the shapes/symbols in the image yourself and TYPE the numeric answer into the input field. Do NOT use report_captcha for these — you can solve them.
-- Math CAPTCHAs ("3 + 5 = ?", "12 - 4 = ?"): CALCULATE the answer and TYPE it. Do NOT use report_captcha.
+- Symbol equation CAPTCHAs: the image shows groups of symbols (triangles, stars, etc.) arranged as a math equation, e.g. "▲▲▲▲▲ - ▲▲ = ?". Count the symbols in EACH group, apply the operator (+, -, ×), and TYPE the numeric result. Example: 5 triangles minus 2 triangles = type "3".
+- Counting CAPTCHAs ("Count the symbols", "How many triangles?"): count every symbol visible and TYPE the total number.
+- Math CAPTCHAs ("3 + 5 = ?", "12 - 4 = ?"): CALCULATE the answer and TYPE it.
 - Text/distorted-word CAPTCHAs: READ the letters and TYPE them.
+- Do NOT use report_captcha for any of the above — you can solve all of them by reading the image.
 - Only use "report_captcha" for image-SELECTION challenges where a human must click specific image tiles (hCaptcha grids, reCAPTCHA "select all traffic lights").
 - After typing a CAPTCHA answer, click the verify/submit button for that CAPTCHA.`;
 
